@@ -1,9 +1,12 @@
 #include <opendriver/core/config_manager.h>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 
 namespace opendriver::core {
+
+namespace fs = std::filesystem;
 
 bool ConfigManager::Load(const std::string& path) {
     std::lock_guard<std::mutex> lock(mutex);
@@ -29,7 +32,30 @@ bool ConfigManager::Load(const std::string& path) {
 bool ConfigManager::Save() {
     std::lock_guard<std::mutex> lock(mutex);
     if (config_path.empty()) return false;
-    
+
+    try {
+        const fs::path target_path(config_path);
+        const fs::path parent_dir = target_path.parent_path();
+        if (!parent_dir.empty()) {
+            fs::create_directories(parent_dir);
+        }
+
+        if (fs::exists(target_path)) {
+            const fs::path backup_path = target_path.string() + ".bak";
+            std::error_code copy_error;
+            fs::copy_file(
+                target_path,
+                backup_path,
+                fs::copy_options::overwrite_existing,
+                copy_error);
+            if (copy_error) {
+                return false;
+            }
+        }
+    } catch (...) {
+        return false;
+    }
+
     std::ofstream file(config_path);
     if (!file.is_open()) return false;
     
@@ -97,13 +123,23 @@ void ConfigManager::SetBool(const std::string& path, bool value) {
     GetValueRef(path, true) = value;
 }
 
-json& ConfigManager::GetPluginConfig(const std::string& plugin_name) {
+json ConfigManager::GetPluginConfig(const std::string& plugin_name) const {
     std::lock_guard<std::mutex> lock(mutex);
-    if (!config.contains("plugins")) config["plugins"] = json::object();
+    if (!config.contains("plugins")) {
+        return json::object();
+    }
     if (!config["plugins"].contains(plugin_name)) {
-        config["plugins"][plugin_name] = json::object();
+        return json::object();
     }
     return config["plugins"][plugin_name];
+}
+
+void ConfigManager::SetPluginConfig(const std::string& plugin_name, const json& plugin_config) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!config.contains("plugins")) {
+        config["plugins"] = json::object();
+    }
+    config["plugins"][plugin_name] = plugin_config;
 }
 
 bool ConfigManager::IsPluginEnabled(const std::string& plugin_name) const {

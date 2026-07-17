@@ -36,6 +36,10 @@ private:
     bool ConvertTextureToNV12Sample(ID3D11Texture2D* sourceTexture,
                                     DXGI_FORMAT sourceFormat,
                                     IMFSample** sampleOut);
+    bool ConvertTextureToNV12GPU(ID3D11Texture2D* sourceTexture,
+                                 DXGI_FORMAT sourceFormat,
+                                 IMFSample** sampleOut);
+    bool InitComputeShader();
     std::vector<uint8_t>& GetPooledNV12Buffer(size_t required_size);
     bool ProcessOutput(std::vector<uint8_t>& out_packet);
     bool RefreshOutputMediaTypeState();
@@ -45,6 +49,12 @@ private:
     void RegisterEncodeSuccess();
     bool IsInFailureCooldown() const;
     void MaybeLogTelemetry(double encode_ms, size_t packet_size_bytes, bool produced_output);
+    void RecordStageTimings(double input_prep_ms,
+                            double process_input_ms,
+                            double process_output_ms,
+                            bool zero_copy_path,
+                            bool fallback_used,
+                            bool not_accepting_hit);
 
     VideoConfig m_config;
     bool m_initialized = false;
@@ -59,6 +69,15 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Query> m_query;
     UINT m_dxToken = 0;
 
+    // CS GPU Conversion
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> m_computeShader;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> m_csOutputTexture;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_csOutputYView;
+    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_csOutputUVView;
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_csInputView;
+    bool m_csInitialized = false;
+    bool m_csFailed = false;
+
     // The H264 Encoder Transform
     Microsoft::WRL::ComPtr<IMFTransform> m_encoderMFT;
     DWORD m_inputStreamId = 0;
@@ -72,6 +91,7 @@ private:
     bool m_sentSequenceHeader = false;
     bool m_isHardwareMFT = false;
     bool m_isNvidiaMFT = false;
+    bool m_isAmdMFT = false;
     bool m_requiresNv12Input = false;
     bool m_allowZeroCopyInput = true;
     uint32_t m_zeroCopyFailures = 0;
@@ -86,11 +106,17 @@ private:
     uint64_t m_processInputFailures = 0;
     uint64_t m_cooldownSkips = 0;
     uint64_t m_telemetryLogCounter = 0;
+    uint64_t m_notAcceptingCount = 0;
     uint32_t m_consecutiveEncodeFailures = 0;
     std::chrono::steady_clock::time_point m_cooldownUntil{};
     static constexpr uint32_t kFailureCooldownThreshold = 4;
     static constexpr uint32_t kFailureCooldownMs = 120;
     static constexpr uint32_t kTelemetryLogInterval = 240;
+    double m_totalInputPrepMs = 0.0;
+    double m_totalProcessInputMs = 0.0;
+    double m_totalProcessOutputMs = 0.0;
+    uint64_t m_zeroCopyFrames = 0;
+    uint64_t m_fallbackFrames = 0;
     std::function<void(const char*)> m_logger;
 };
 

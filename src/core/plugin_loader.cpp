@@ -1,4 +1,5 @@
 #include <opendriver/core/plugin_loader.h>
+#include <opendriver/core/config_manager.h>
 #include <opendriver/core/event_bus.h>
 #include <opendriver/core/dynlib.h>
 #include <iostream>
@@ -173,9 +174,15 @@ int PluginLoader::LoadDirectory(const std::string& plugins_dir, bool recursive) 
             std::ifstream f(json_path);
             nlohmann::json j = nlohmann::json::parse(f);
             
-            bool enabled = j.value("enabled", true);
+            const std::string plugin_name =
+                j.value("name", entry.path().filename().string());
+            const bool enabled = context->GetConfig().GetBool(
+                "plugins." + plugin_name + ".enabled",
+                j.value("enabled", true));
             if (!enabled) {
-                Logger::GetInstance().Debug("PluginLoader", "Plugin disabled in json: " + entry.path().filename().string());
+                Logger::GetInstance().Debug(
+                    "PluginLoader",
+                    "Plugin disabled by effective config: " + plugin_name);
                 continue;
             }
 
@@ -463,7 +470,9 @@ void PluginLoader::ScanDirectory(const std::string& plugins_dir) {
             ap.description = data.value("description", "");
             ap.author = data.value("author", "Unknown");
             ap.path = entry.path().string();
-            ap.is_enabled = data.value("enabled", true);
+            ap.is_enabled = context->GetConfig().GetBool(
+                "plugins." + ap.name + ".enabled",
+                data.value("enabled", true));
             ap.is_loaded = (plugins.find(ap.name) != plugins.end());
             
             available_plugins.push_back(ap);

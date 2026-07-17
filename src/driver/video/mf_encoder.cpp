@@ -15,6 +15,7 @@
 #include <sstream>
 #include <vector>
 #include <thread>
+#include <d3dcompiler.h>
 
 
 #pragma comment(lib, "d3d11.lib")
@@ -395,6 +396,7 @@ bool MediaFoundationEncoder::Initialize(const VideoConfig& config) {
     m_processInputFailures = 0;
     m_cooldownSkips = 0;
     m_telemetryLogCounter = 0;
+    m_notAcceptingCount = 0;
     m_consecutiveEncodeFailures = 0;
     m_cooldownUntil = std::chrono::steady_clock::time_point{};
     m_poolIdx = 0;
@@ -402,6 +404,11 @@ bool MediaFoundationEncoder::Initialize(const VideoConfig& config) {
     m_requiresNv12Input = false;
     m_allowZeroCopyInput = true;
     m_zeroCopyFailures = 0;
+    m_totalInputPrepMs = 0.0;
+    m_totalProcessInputMs = 0.0;
+    m_totalProcessOutputMs = 0.0;
+    m_zeroCopyFrames = 0;
+    m_fallbackFrames = 0;
     return true;
 }
 
@@ -433,9 +440,15 @@ void MediaFoundationEncoder::Shutdown() {
     m_sentSequenceHeader = false;
     m_isHardwareMFT = false;
     m_isNvidiaMFT = false;
+    m_isAmdMFT = false;
     m_requiresNv12Input = false;
     m_allowZeroCopyInput = true;
     m_zeroCopyFailures = 0;
+    m_totalInputPrepMs = 0.0;
+    m_totalProcessInputMs = 0.0;
+    m_totalProcessOutputMs = 0.0;
+    m_zeroCopyFrames = 0;
+    m_fallbackFrames = 0;
     m_inputFramesSubmitted = 0;
     m_outputSamplesProduced = 0;
     m_encodeAttempts = 0;
@@ -444,8 +457,16 @@ void MediaFoundationEncoder::Shutdown() {
     m_processInputFailures = 0;
     m_cooldownSkips = 0;
     m_telemetryLogCounter = 0;
+    m_notAcceptingCount = 0;
     m_consecutiveEncodeFailures = 0;
     m_cooldownUntil = std::chrono::steady_clock::time_point{};
+    m_csInitialized = false;
+    m_csFailed = false;
+    m_computeShader.Reset();
+    m_csOutputTexture.Reset();
+    m_csOutputYView.Reset();
+    m_csOutputUVView.Reset();
+    m_csInputView.Reset();
 }
 
 std::string MediaFoundationEncoder::GetLastError() const {
@@ -496,7 +517,7 @@ void MediaFoundationEncoder::MaybeLogTelemetry(double encode_ms,
     char diag[256];
     std::snprintf(
         diag, sizeof(diag),
-        "OpenDriver [DX11]: Telemetry attempts=%llu failures=%llu in=%llu out=%llu out_fail=%llu cooldown_skips=%llu zero_copy_fail=%u encode_ms=%.2f packet=%zu produced=%s",
+        "OpenDriver [DX11]: Telemetry attempts=%llu failures=%llu in=%llu out=%llu out_fail=%llu cooldown_skips=%llu zero_copy_fail=%u not_accept=%llu input_prep_ms=%.2f process_in_ms=%.2f process_out_ms=%.2f encode_ms=%.2f packet=%zu produced=%s zero_copy=%llu fallback=%llu",
         static_cast<unsigned long long>(m_encodeAttempts),
         static_cast<unsigned long long>(m_encodeFailures),
         static_cast<unsigned long long>(m_inputFramesSubmitted),
@@ -504,10 +525,36 @@ void MediaFoundationEncoder::MaybeLogTelemetry(double encode_ms,
         static_cast<unsigned long long>(m_processOutputFailures),
         static_cast<unsigned long long>(m_cooldownSkips),
         m_zeroCopyFailures,
+        static_cast<unsigned long long>(m_notAcceptingCount),
+        m_totalInputPrepMs / static_cast<double>(std::max<uint64_t>(1, m_telemetryLogCounter)),
+        m_totalProcessInputMs / static_cast<double>(std::max<uint64_t>(1, m_telemetryLogCounter)),
+        m_totalProcessOutputMs / static_cast<double>(std::max<uint64_t>(1, m_telemetryLogCounter)),
         encode_ms,
         packet_size_bytes,
-        produced_output ? "yes" : "no");
+        produced_output ? "yes" : "no",
+        static_cast<unsigned long long>(m_zeroCopyFrames),
+        static_cast<unsigned long long>(m_fallbackFrames));
     m_logger(diag);
+}
+
+void MediaFoundationEncoder::RecordStageTimings(double input_prep_ms,
+                                                double process_input_ms,
+                                                double process_output_ms,
+                                                bool zero_copy_path,
+                                                bool fallback_used,
+                                                bool not_accepting_hit) {
+    m_totalInputPrepMs += input_prep_ms;
+    m_totalProcessInputMs += process_input_ms;
+    m_totalProcessOutputMs += process_output_ms;
+    if (zero_copy_path) {
+        ++m_zeroCopyFrames;
+    }
+    if (fallback_used) {
+        ++m_fallbackFrames;
+    }
+    if (not_accepting_hit) {
+        ++m_notAcceptingCount;
+    }
 }
 
 // ============================================================================
@@ -517,11 +564,7 @@ std::vector<uint8_t>& MediaFoundationEncoder::GetPooledNV12Buffer(size_t require
     auto& buf = m_nv12BufferPool[m_poolIdx];
     m_poolIdx = 1 - m_poolIdx;  // Alternate between buffers
 
-    if (buf.capacity() < required_size) {
-        buf.resize(required_size);
-    } else {
-        buf.resize(required_size);
-    }
+    buf.resize(required_size);
     return buf;
 }
 
@@ -542,6 +585,7 @@ std::vector<uint8_t>& MediaFoundationEncoder::GetPooledNV12Buffer(size_t require
         }
 
         const HANDLE shared_handle = reinterpret_cast<HANDLE>(texture_handle);
+        const auto input_prep_start = std::chrono::steady_clock::now();
 
         Microsoft::WRL::ComPtr<ID3D11Texture2D> shared_texture;
         HRESULT hr = m_d3dDevice->OpenSharedResource(
@@ -571,7 +615,7 @@ std::vector<uint8_t>& MediaFoundationEncoder::GetPooledNV12Buffer(size_t require
         D3D11_TEXTURE2D_DESC desc{};
         shared_texture->GetDesc(&desc);
         const bool can_try_zero_copy =
-            m_isHardwareMFT && m_isNvidiaMFT && !m_requiresNv12Input && m_allowZeroCopyInput;
+            m_isHardwareMFT && (m_isNvidiaMFT || m_isAmdMFT) && !m_requiresNv12Input && m_allowZeroCopyInput;
 
         bool sample_ready = false;
         if (can_try_zero_copy) {
@@ -585,6 +629,10 @@ std::vector<uint8_t>& MediaFoundationEncoder::GetPooledNV12Buffer(size_t require
                     }
                 }
             }
+        }
+
+        if (!sample_ready) {
+            sample_ready = ConvertTextureToNV12GPU(shared_texture.Get(), desc.Format, sample.GetAddressOf());
         }
 
         if (!sample_ready) {
@@ -607,13 +655,28 @@ std::vector<uint8_t>& MediaFoundationEncoder::GetPooledNV12Buffer(size_t require
         m_frameIndex++;
 
         // Feed encoder
+        const auto input_prep_end = std::chrono::steady_clock::now();
+        const double input_prep_ms =
+            std::chrono::duration<double, std::milli>(input_prep_end - input_prep_start).count();
+
+        const auto process_input_start = std::chrono::steady_clock::now();
         hr = m_encoderMFT->ProcessInput(m_inputStreamId, sample.Get(), 0);
+        const auto process_input_end = std::chrono::steady_clock::now();
+        const double process_input_ms =
+            std::chrono::duration<double, std::milli>(process_input_end - process_input_start).count();
 
         if (hr == MF_E_NOTACCEPTING) {
+            ++m_notAcceptingCount;
             std::vector<uint8_t> drained;
+            const auto process_output_start = std::chrono::steady_clock::now();
             ProcessOutput(drained);
+            const auto process_output_end = std::chrono::steady_clock::now();
+            const double process_output_ms =
+                std::chrono::duration<double, std::milli>(process_output_end - process_output_start).count();
             out_packet.insert(out_packet.end(), drained.begin(), drained.end());
 
+            RecordStageTimings(input_prep_ms, process_input_ms, process_output_ms,
+                               can_try_zero_copy, !can_try_zero_copy, true);
             hr = m_encoderMFT->ProcessInput(m_inputStreamId, sample.Get(), 0);
         }
 
@@ -635,9 +698,15 @@ std::vector<uint8_t>& MediaFoundationEncoder::GetPooledNV12Buffer(size_t require
             m_zeroCopyFailures = 0;
         }
         ++m_inputFramesSubmitted;
+        const auto process_output_start = std::chrono::steady_clock::now();
         const bool produced = ProcessOutput(out_packet);
+        const auto process_output_end = std::chrono::steady_clock::now();
+        const double process_output_ms =
+            std::chrono::duration<double, std::milli>(process_output_end - process_output_start).count();
         const auto encode_end = std::chrono::steady_clock::now();
         const double encode_ms = std::chrono::duration<double, std::milli>(encode_end - encode_start).count();
+        RecordStageTimings(input_prep_ms, process_input_ms, process_output_ms,
+                           can_try_zero_copy, !can_try_zero_copy, false);
         if (produced) {
             RegisterEncodeSuccess();
         } else {
@@ -882,13 +951,14 @@ bool MediaFoundationEncoder::SetupEncoderMFT(const VideoConfig& config) {
                 VARIANT var;
                 VariantInit(&var);
                 
-                // Adaptive GOP size
+                // Adaptive GOP size — VR streaming over UDP needs frequent keyframes
+                // to recover from packet loss quickly
                 uint32_t area = config.width * config.height;
-                uint32_t gop_size = 30;  // default
+                uint32_t gop_size = 15;  // default: keyframe every ~0.17s @ 90fps
                 if (area > 3840 * 2160) {  // 4K
-                    gop_size = 60;  // Keyframe every 1 sec @ 60fps
+                    gop_size = 30;  // Keyframe every 0.33 sec @ 90fps
                 } else if (area < 1280 * 720) {  // < 720p
-                    gop_size = 15;  // Keyframe every 0.25 sec
+                    gop_size = 10;  // Keyframe every ~0.11 sec
                 }
 
                 var.vt = VT_UI4;
@@ -988,6 +1058,7 @@ bool MediaFoundationEncoder::SetupEncoderMFT(const VideoConfig& config) {
             m_outputStreamId = output_stream_id;
             m_isHardwareMFT = pass.set_d3d_manager;
             m_isNvidiaMFT = encoder_label.find("NVIDIA") != std::string::npos;
+            m_isAmdMFT = encoder_label.find("AMD") != std::string::npos || encoder_label.find("AMF") != std::string::npos;
             m_requiresNv12Input = false;
             for (const InputSubtype& input_subtype : input_subtypes) {
                 if (input_type_name == input_subtype.name &&
@@ -1005,6 +1076,8 @@ bool MediaFoundationEncoder::SetupEncoderMFT(const VideoConfig& config) {
             SetLastError("Using encoder " + encoder_label + " with " + input_type_name);
             if (m_logger && m_isNvidiaMFT) {
                 m_logger("OpenDriver [DX11]: NVIDIA hardware encoder selected (NVENC via MFT)");
+            } else if (m_logger && m_isAmdMFT) {
+                m_logger("OpenDriver [DX11]: AMD hardware encoder selected (AMF via MFT)");
             }
             release_activates(activates, activate_count);
             return true;
@@ -1157,16 +1230,30 @@ bool MediaFoundationEncoder::ConvertTextureToNV12Sample(ID3D11Texture2D* sourceT
         m_logger(diagBuf);
     }
 
-    // OPTIMIZATION: Use pooled buffer + parallel conversion
+    // OPTIMIZATION: Use pooled buffer and switch to parallel conversion only
+    // for larger frames where thread overhead is worth it.
     std::vector<uint8_t>& nv12_buf = GetPooledNV12Buffer(
         static_cast<size_t>(textureDesc.Width) * textureDesc.Height * 3 / 2);
 
-    mfcolor::ConvertPackedRgbToNV12(static_cast<const uint8_t*>(mapped.pData),
-                                    mapped.RowPitch,
-                                    textureDesc.Width,
-                                    textureDesc.Height,
-                                    sourceFormat,
-                                    nv12_buf);
+    const size_t pixel_count = static_cast<size_t>(textureDesc.Width) * textureDesc.Height;
+    const bool use_parallel_convert =
+        pixel_count >= (1920u * 1080u) && std::thread::hardware_concurrency() > 1;
+
+    if (use_parallel_convert) {
+        ConvertPackedRgbToNV12_Parallel(static_cast<const uint8_t*>(mapped.pData),
+                                        mapped.RowPitch,
+                                        textureDesc.Width,
+                                        textureDesc.Height,
+                                        sourceFormat,
+                                        nv12_buf);
+    } else {
+        mfcolor::ConvertPackedRgbToNV12(static_cast<const uint8_t*>(mapped.pData),
+                                        mapped.RowPitch,
+                                        textureDesc.Width,
+                                        textureDesc.Height,
+                                        sourceFormat,
+                                        nv12_buf);
+    }
     m_d3dContext->Unmap(m_stagingTexture.Get(), 0);
 
     // Hardware DXGI-surface input path remains disabled for stability.
@@ -1485,11 +1572,187 @@ void MediaFoundationEncoder::ResetDeviceResources() {
     m_sequenceHeaderAnnexB.clear();
     m_sentSequenceHeader = false;
     m_isNvidiaMFT = false;
+    m_isAmdMFT = false;
     m_allowZeroCopyInput = true;
     m_zeroCopyFailures = 0;
     m_consecutiveEncodeFailures = 0;
     m_cooldownUntil = std::chrono::steady_clock::time_point{};
     m_initialized = true;
+    m_csInitialized = false;
+    m_csFailed = false;
+    m_computeShader.Reset();
+    m_csOutputTexture.Reset();
+    m_csOutputYView.Reset();
+    m_csOutputUVView.Reset();
+    m_csInputView.Reset();
+}
+
+typedef HRESULT(WINAPI* pD3DCompile_t)(LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName, const D3D_SHADER_MACRO* pDefines, ID3DInclude* pInclude, LPCSTR pEntrypoint, LPCSTR pTarget, UINT Flags1, UINT Flags2, ID3DBlob** ppCode, ID3DBlob** ppErrorMsgs);
+
+bool MediaFoundationEncoder::InitComputeShader() {
+    if (m_csInitialized) return true;
+    if (m_csFailed) return false;
+
+    HMODULE hD3DCompiler = LoadLibraryA("d3dcompiler_47.dll");
+    if (!hD3DCompiler) {
+        if (m_logger) m_logger("OpenDriver [DX11]: CPU Fallback - d3dcompiler_47.dll not found");
+        m_csFailed = true;
+        return false;
+    }
+
+    auto pD3DCompile = (pD3DCompile_t)GetProcAddress(hD3DCompiler, "D3DCompile");
+    if (!pD3DCompile) {
+        if (m_logger) m_logger("OpenDriver [DX11]: CPU Fallback - D3DCompile not found");
+        m_csFailed = true;
+        return false;
+    }
+
+    const char* shaderCode = R"(
+        Texture2D<unorm float4> g_Input : register(t0);
+        RWTexture2D<unorm float> g_OutputY : register(u0);
+        RWTexture2D<unorm float2> g_OutputUV : register(u1);
+
+        [numthreads(8, 8, 1)]
+        void main(uint3 DTid : SV_DispatchThreadID)
+        {
+            float4 rgb = g_Input[DTid.xy];
+            
+            float y = 0.256788 * rgb.r + 0.504129 * rgb.g + 0.097906 * rgb.b + 0.0625;
+            float u = -0.148223 * rgb.r - 0.290993 * rgb.g + 0.439216 * rgb.b + 0.5;
+            float v = 0.439216 * rgb.r - 0.367788 * rgb.g - 0.071427 * rgb.b + 0.5;
+            
+            g_OutputY[DTid.xy] = y;
+            
+            if ((DTid.x % 2 == 0) && (DTid.y % 2 == 0))
+            {
+                g_OutputUV[DTid.xy / 2] = float2(u, v);
+            }
+        }
+    )";
+
+    Microsoft::WRL::ComPtr<ID3DBlob> blob, errorBlob;
+    HRESULT hr = pD3DCompile(shaderCode, strlen(shaderCode), nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &blob, &errorBlob);
+    if (FAILED(hr)) {
+        if (m_logger) {
+            std::string err = "OpenDriver [DX11]: CPU Fallback - Shader compile failed: ";
+            if (errorBlob) err += (char*)errorBlob->GetBufferPointer();
+            m_logger(err.c_str());
+        }
+        m_csFailed = true;
+        return false;
+    }
+
+    hr = m_d3dDevice->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &m_computeShader);
+    if (FAILED(hr)) {
+        if (m_logger) m_logger("OpenDriver [DX11]: CPU Fallback - CreateComputeShader failed");
+        m_csFailed = true;
+        return false;
+    }
+
+    m_csInitialized = true;
+    if (m_logger) m_logger("OpenDriver [DX11]: GPU Compute Shader NV12 conversion initialized successfully");
+    return true;
+}
+
+bool MediaFoundationEncoder::ConvertTextureToNV12GPU(ID3D11Texture2D* sourceTexture, DXGI_FORMAT sourceFormat, IMFSample** sampleOut) {
+    if (!InitComputeShader()) return false;
+
+    D3D11_TEXTURE2D_DESC srcDesc;
+    sourceTexture->GetDesc(&srcDesc);
+
+    if ((srcDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0) {
+        if (m_logger && !m_csFailed) {
+            m_logger("OpenDriver [DX11]: CPU Fallback - source texture lacks BIND_SHADER_RESOURCE");
+            m_csFailed = true; // Prevent spamming log
+        }
+        return false;
+    }
+
+    if (!m_csOutputTexture) {
+        D3D11_TEXTURE2D_DESC dstDesc = srcDesc;
+        dstDesc.Format = DXGI_FORMAT_NV12;
+        dstDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        dstDesc.Usage = D3D11_USAGE_DEFAULT;
+        dstDesc.CPUAccessFlags = 0;
+        dstDesc.MiscFlags = 0;
+
+        HRESULT hr = m_d3dDevice->CreateTexture2D(&dstDesc, nullptr, &m_csOutputTexture);
+        if (FAILED(hr)) {
+            if (m_logger) m_logger("OpenDriver [DX11]: CPU Fallback - NV12 texture creation failed (GPU unsupported)");
+            m_csFailed = true;
+            return false;
+        }
+
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDescY{};
+        uavDescY.Format = DXGI_FORMAT_R8_UNORM;
+        uavDescY.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        hr = m_d3dDevice->CreateUnorderedAccessView(m_csOutputTexture.Get(), &uavDescY, &m_csOutputYView);
+        if (FAILED(hr)) {
+            m_csFailed = true;
+            return false;
+        }
+
+        D3D11_UNORDERED_ACCESS_VIEW_DESC uavDescUV{};
+        uavDescUV.Format = DXGI_FORMAT_R8G8_UNORM;
+        uavDescUV.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+        hr = m_d3dDevice->CreateUnorderedAccessView(m_csOutputTexture.Get(), &uavDescUV, &m_csOutputUVView);
+        if (FAILED(hr)) {
+            m_csFailed = true;
+            return false;
+        }
+    }
+
+    if (!m_csInputView) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = srcDesc.Format;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        
+        HRESULT hr = m_d3dDevice->CreateShaderResourceView(sourceTexture, &srvDesc, &m_csInputView);
+        if (FAILED(hr)) {
+            return false;
+        }
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIKeyedMutex> keyedMutex;
+    if (srcDesc.MiscFlags & 0x100) {
+        if (SUCCEEDED(sourceTexture->QueryInterface(__uuidof(IDXGIKeyedMutex), (void**)keyedMutex.GetAddressOf()))) {
+            if (FAILED(keyedMutex->AcquireSync(0, 20))) {
+                return false;
+            }
+        }
+    }
+
+    ID3D11UnorderedAccessView* uavs[] = { m_csOutputYView.Get(), m_csOutputUVView.Get() };
+    m_d3dContext->CSSetShader(m_computeShader.Get(), nullptr, 0);
+    m_d3dContext->CSSetShaderResources(0, 1, m_csInputView.GetAddressOf());
+    m_d3dContext->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+    
+    m_d3dContext->Dispatch((srcDesc.Width + 7) / 8, (srcDesc.Height + 7) / 8, 1);
+    
+    ID3D11UnorderedAccessView* nullUAVs[] = { nullptr, nullptr };
+    m_d3dContext->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
+    ID3D11ShaderResourceView* nullSRVs[] = { nullptr };
+    m_d3dContext->CSSetShaderResources(0, 1, nullSRVs);
+
+    if (keyedMutex) {
+        keyedMutex->ReleaseSync(0);
+    }
+
+    if (m_query) {
+        m_d3dContext->End(m_query.Get());
+        m_d3dContext->Flush();
+
+        if (!WaitForGpuEvent(m_d3dContext.Get(), m_query.Get(), 20)) {
+            if (m_logger) {
+                m_logger("OpenDriver [DX11]: GPU sync timeout in CS - frame may be stale");
+            }
+        }
+    } else {
+        m_d3dContext->Flush();
+    }
+
+    return CreateSampleFromTexture(m_csOutputTexture.Get(), sampleOut);
 }
 
 } // namespace opendriver::driver::video

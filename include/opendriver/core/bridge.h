@@ -103,6 +103,7 @@ public:
                     j["serial_number"] = device->serial_number;
                     j["type"] = static_cast<uint32_t>(device->type);
                     j["name"] = device->name;
+                    j["manufacturer"] = device->manufacturer;
                     
                     // Parametry wyświetlacza (kluczowe dla HMD!)
                     if (device->type == DeviceType::HMD) {
@@ -249,6 +250,7 @@ private:
             j["serial_number"] = device->serial_number;
             j["type"] = static_cast<uint32_t>(device->type);
             j["name"] = device->name;
+            j["manufacturer"] = device->manufacturer;
             
             if (device->type == DeviceType::HMD) {
                 nlohmann::json disp;

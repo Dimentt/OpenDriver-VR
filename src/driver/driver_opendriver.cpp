@@ -11,6 +11,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <deque>
 #include <unordered_map>
 #include <nlohmann/json.hpp>
 #include <opendriver/core/ipc.h>
@@ -22,36 +23,18 @@
 #include <thread>
 #include <vector>
 
-#if defined(OD_PLATFORM_LINUX)
-#include <dlfcn.h>
-#include <fcntl.h>
-#include <libdrm/drm_fourcc.h>
-#include <linux/dma-buf.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/types.h>
-#include <unistd.h>
-#elif defined(OD_PLATFORM_WINDOWS)
 #include "video/video_encoder.h"
 #include <d3d11.h>
 #include <wrl/client.h>
-#endif
-
-#if HAVE_X264
-#include <x264.h>
-extern "C" {
-#include <libavutil/imgutils.h>
-#include <libswscale/swscale.h>
-}
-#endif
+#include <intrin.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 
 namespace fs = std::filesystem;
 
 using namespace vr;
 using namespace opendriver::core;
-#if defined(OD_PLATFORM_WINDOWS)
 namespace video = opendriver::driver::video;
-#endif
 
 #if defined(_WIN32)
 #define HMD_DLL_EXPORT __declspec(dllexport)
@@ -68,20 +51,24 @@ extern "C" HMD_DLL_EXPORT void *HmdDriverFactory(const char *pInterfaceName,
 
 class COpenDriverDevice : public ITrackedDeviceServerDriver {
 public:
-  COpenDriverDevice(const std::string &serial) : serial_number(serial) {}
+  COpenDriverDevice(const std::string &serial,
+                    const std::string &model = "OpenDriver Modular Device",
+                    const std::string &manufacturer = "OpenDriver Project")
+      : serial_number(serial), model_name(model),
+        manufacturer_name(manufacturer) {}
 
   EVRInitError Activate(uint32_t unObjectId) override {
     object_id = unObjectId;
     property_container =
         VRProperties()->TrackedDeviceToPropertyContainer(object_id);
 
-    VRProperties()->SetStringProperty(property_container,
-                                      Prop_ModelNumber_String,
-                                      "OpenDriver Modular Device");
+    VRProperties()->SetStringProperty(property_container, Prop_ModelNumber_String,
+                                      model_name.c_str());
     VRProperties()->SetStringProperty(
         property_container, Prop_SerialNumber_String, serial_number.c_str());
     VRProperties()->SetStringProperty(
-        property_container, Prop_ManufacturerName_String, "OpenDriver Project");
+        property_container, Prop_ManufacturerName_String,
+        manufacturer_name.c_str());
 
     // Rejestracja wibracji (domyślnie dla każdego drajwera OpenDriver)
     VRDriverInput()->CreateHapticComponent(property_container,
@@ -143,11 +130,66 @@ protected:
 
 private:
   std::string serial_number;
+  std::string model_name;
+  std::string manufacturer_name;
   uint32_t object_id = k_unTrackedDeviceIndexInvalid;
   PropertyContainerHandle_t property_container = k_ulInvalidPropertyContainer;
   VRInputComponentHandle_t haptic_handle = k_ulInvalidInputComponentHandle;
   std::map<std::string, VRInputComponentHandle_t> input_handles;
   DriverPose_t cached_pose = Mapper::CreateDefaultPose();
+};
+
+class COpenDriverController : public COpenDriverDevice {
+public:
+  static constexpr const char *kControllerType = "vive_controller";
+  static constexpr const char *kRegisteredDeviceType = "htc/vive_controller";
+  static constexpr const char *kInputProfilePath =
+      "{htc}/input/vive_controller_profile.json";
+  static constexpr const char *kRenderModelName = "vr_controller_vive_1_5";
+
+  COpenDriverController(const std::string &serial, bool is_left_hand)
+      : COpenDriverDevice(serial, "HTC Vive Controller", "HTC"),
+        m_is_left_hand(is_left_hand) {}
+
+  EVRInitError Activate(uint32_t unObjectId) override {
+    EVRInitError err = COpenDriverDevice::Activate(unObjectId);
+    if (err != VRInitError_None) {
+      return err;
+    }
+
+    auto container = GetPropertyContainer();
+    VRProperties()->SetStringProperty(container, Prop_TrackingSystemName_String,
+                                      "lighthouse");
+    VRProperties()->SetStringProperty(container,
+                                      Prop_ActualTrackingSystemName_String,
+                                      "lighthouse");
+    VRProperties()->SetStringProperty(container,
+                                      Prop_RegisteredDeviceType_String,
+                                      kRegisteredDeviceType);
+    VRProperties()->SetStringProperty(container, Prop_ControllerType_String,
+                                      kControllerType);
+    VRProperties()->SetStringProperty(container, Prop_InputProfilePath_String,
+                                      kInputProfilePath);
+    VRProperties()->SetStringProperty(container, Prop_RenderModelName_String,
+                                      kRenderModelName);
+    VRProperties()->SetInt32Property(
+        container, Prop_ControllerRoleHint_Int32,
+        m_is_left_hand ? TrackedControllerRole_LeftHand
+                       : TrackedControllerRole_RightHand);
+    VRProperties()->SetBoolProperty(container, Prop_DeviceIsWireless_Bool,
+                                    true);
+    VRProperties()->SetBoolProperty(container,
+                                    Prop_DeviceProvidesBatteryStatus_Bool,
+                                    true);
+    VRProperties()->SetFloatProperty(container,
+                                     Prop_DeviceBatteryPercentage_Float, 1.0f);
+    VRProperties()->SetBoolProperty(container, Prop_DeviceIsCharging_Bool,
+                                    true);
+    return VRInitError_None;
+  }
+
+private:
+  bool m_is_left_hand = false;
 };
 
 // ============================================================================
@@ -183,12 +225,10 @@ public:
   // Wczytaj ustawienia video z config.json
   void LoadVideoConfig() {
     try {
-      const char *home_env = std::getenv("HOME");
-      if (!home_env)
-        return;
-
-      std::string config_file =
-          std::string(home_env) + "/.config/opendriver/config.json";
+      // Użyj GetDefaultConfigDir() z platform.h — automatycznie obsługuje
+      // APPDATA na Windows i HOME/.config na Linux.
+      std::string config_dir = opendriver::core::GetDefaultConfigDir();
+      std::string config_file = config_dir + OD_PATH_SEP "config.json";
       if (!fs::exists(config_file))
         return;
 
@@ -234,25 +274,14 @@ public:
   }
 
   void CleanupEncoder() {
-#if HAVE_X264
-    if (m_encoder) {
-      x264_encoder_close(m_encoder);
-      m_encoder = nullptr;
+    if (m_winEncoder) {
+      m_winEncoder->Shutdown();
+      m_winEncoder.reset();
     }
-    if (m_pic_allocated) {
-      x264_picture_clean(&m_pic_in);
-      m_pic_allocated = false;
-    }
-    if (m_sws_ctx) {
-      sws_freeContext(m_sws_ctx);
-      m_sws_ctx = nullptr;
-    }
-#endif
     m_is_encoder_ready = false;
   }
 
   void InitEncoder() {
-#if defined(OD_PLATFORM_WINDOWS)
     // ─── WINDOWS HARDWARE ENCODING (MEDIA FOUNDATION / D3D11 ZERO COPY) ───
     video::VideoConfig cfg;
     cfg.width = width;
@@ -261,91 +290,33 @@ public:
     cfg.bitrate_mbps = m_bitrate_mbps;
     cfg.preset = m_quality_preset;
 
-    m_winEncoder = video::CreateMediaFoundationEncoder();
+    m_winEncoder = video::CreateNvencEncoder();
     m_winEncoder->SetLogger([](const char* msg) {
       if (VRDriverLog()) VRDriverLog()->Log(msg);
     });
+    
     m_is_encoder_ready = m_winEncoder->Initialize(cfg);
-
-    if (m_is_encoder_ready && VRDriverLog()) {
-      VRDriverLog()->Log("OpenDriver: Windows Media Foundation encoder staged "
-                         "(MFT activation deferred until first frame)");
+    
+    if (!m_is_encoder_ready) {
+        if (VRDriverLog()) {
+            std::string err = "OpenDriver: NVENC initialization failed. Falling back to Media Foundation. Reason: " + m_winEncoder->GetLastError();
+            VRDriverLog()->Log(err.c_str());
+        }
+        
+        m_winEncoder = video::CreateMediaFoundationEncoder();
+        m_winEncoder->SetLogger([](const char* msg) {
+          if (VRDriverLog()) VRDriverLog()->Log(msg);
+        });
+        m_is_encoder_ready = m_winEncoder->Initialize(cfg);
+        
+        if (m_is_encoder_ready && VRDriverLog()) {
+          VRDriverLog()->Log("OpenDriver: Windows Media Foundation encoder staged.");
+        }
+    } else {
+        if (VRDriverLog()) {
+          VRDriverLog()->Log("OpenDriver: NVENC encoder staged successfully.");
+        }
     }
-    return;
-#endif
-
-#if !HAVE_X264
-    if (VRDriverLog())
-      VRDriverLog()->Log(
-          "OpenDriver: H264 encoding not available (x264 not installed)");
-    m_is_encoder_ready = false;
-    return;
-#else
-    x264_param_t param;
-    x264_param_default_preset(&param, "ultrafast", "zerolatency");
-
-    param.i_width = width;
-    param.i_height = height;
-    param.i_fps_num = (int)refresh_rate;
-    param.i_fps_den = 1;
-    param.i_csp = X264_CSP_I420;
-    param.i_threads = 4;        // Use 4 CPU threads for encoding
-    param.b_sliced_threads = 1; // Sliced threading for lower latency
-    param.i_log_level = X264_LOG_WARNING;
-
-    // Rate control — target reasonable bitrate for VR streaming
-    param.rc.i_rc_method = X264_RC_ABR;
-    param.rc.i_bitrate = m_bitrate_mbps * 1000;         // Convert Mbps to kbps
-    param.rc.i_vbv_max_bitrate = m_bitrate_mbps * 1667; // Max burst ~1.67x
-    param.rc.i_vbv_buffer_size = m_bitrate_mbps * 1667;
-
-    // Low-latency settings
-    param.i_keyint_max = (int)refresh_rate * 2; // IDR every 2 seconds
-    param.i_keyint_min = (int)refresh_rate;
-    param.b_intra_refresh = 0;
-    param.i_bframe = 0;         // No B-frames for lowest latency
-    param.b_repeat_headers = 1; // SPS/PPS with each IDR
-
-    if (x264_param_apply_profile(&param, "baseline") < 0) {
-      if (VRDriverLog())
-        VRDriverLog()->Log("OpenDriver: x264 profile apply failed!");
-      return;
-    }
-
-    m_encoder = x264_encoder_open(&param);
-    if (!m_encoder) {
-      if (VRDriverLog())
-        VRDriverLog()->Log("OpenDriver: x264_encoder_open failed!");
-      return;
-    }
-
-    if (x264_picture_alloc(&m_pic_in, X264_CSP_I420, width, height) < 0) {
-      x264_encoder_close(m_encoder);
-      m_encoder = nullptr;
-      if (VRDriverLog())
-        VRDriverLog()->Log("OpenDriver: x264_picture_alloc failed!");
-      return;
-    }
-    m_pic_allocated = true;
-
-    // SwsContext: RGBA → YUV420P
-    m_sws_ctx =
-        sws_getContext(width, height, AV_PIX_FMT_RGBA, width, height,
-                       AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, NULL, NULL, NULL);
-
-    m_is_encoder_ready = (m_encoder != nullptr && m_sws_ctx != nullptr);
-
-    if (m_is_encoder_ready && VRDriverLog()) {
-      char buf[256];
-      snprintf(
-          buf, sizeof(buf),
-          "OpenDriver: H264 CPU encoder ready — %ux%u @ %dHz, ABR %d kbps, %d "
-          "threads, preset=%s",
-          width, height, (int)refresh_rate, m_bitrate_mbps * 1000,
-          param.i_threads, m_quality_preset.c_str());
-      VRDriverLog()->Log(buf);
-    }
-#endif
   }
 
   void SetDisplayParams(uint32_t w, uint32_t h, float refresh, float fovL,
@@ -357,9 +328,9 @@ public:
     fov_left = fovL;
     fov_right = fovR;
 
-    if (changed || !m_encoder) {
-      CleanupEncoder();
-      InitEncoder();
+    if (changed || !m_winEncoder) {
+      m_reconfigure_requested.store(true);
+      m_video_cv.notify_one();
     }
   }
 
@@ -385,21 +356,22 @@ public:
   void VideoEncoderLoop() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     while (m_video_thread_running) {
-      if (m_reconfigure_requested.exchange(false)) {
-        CleanupEncoder();
-        InitEncoder();
-      }
-
       void* texture_handle = nullptr;
       {
         std::unique_lock<std::mutex> lock(m_video_mutex);
-        m_video_cv.wait(lock, [this] { return !m_video_thread_running || m_last_texture_handle != nullptr; });
+        m_video_cv.wait(lock, [this] { return !m_video_thread_running || m_last_texture_handle != nullptr || m_reconfigure_requested.load(); });
         if (!m_video_thread_running) break;
+        
+        if (m_reconfigure_requested.exchange(false)) {
+          CleanupEncoder();
+          InitEncoder();
+        }
+
         texture_handle = m_last_texture_handle;
         m_last_texture_handle = nullptr;
       }
 
-      if (!texture_handle) continue;
+      if (!texture_handle || !m_winEncoder) continue;
 
       std::vector<uint8_t> out_packet;
       auto frame_start = std::chrono::steady_clock::now();
@@ -411,11 +383,11 @@ public:
         encode_ms = std::chrono::duration<double, std::milli>(after_encode - frame_start).count();
         if (!out_packet.empty()) {
           std::lock_guard<std::mutex> send_lock(m_send_mutex);
-          if (!m_pending_packet.empty()) {
+          if (m_pending_packets.size() >= kMaxPendingPackets) {
+            m_pending_packets.pop_front();
             m_send_overwrite_frames++;
           }
-          m_pending_packet = std::move(out_packet);
-          m_has_pending_packet = true;
+          m_pending_packets.push_back(std::move(out_packet));
           m_send_cv.notify_one();
         }
       } else {
@@ -438,14 +410,13 @@ public:
       {
         std::unique_lock<std::mutex> lock(m_send_mutex);
         m_send_cv.wait(lock, [this] {
-          return !m_video_thread_running || m_has_pending_packet;
+          return !m_video_thread_running || !m_pending_packets.empty();
         });
         if (!m_video_thread_running) {
           break;
         }
-        packet = std::move(m_pending_packet);
-        m_pending_packet.clear();
-        m_has_pending_packet = false;
+        packet = std::move(m_pending_packets.front());
+        m_pending_packets.pop_front();
       }
 
       if (packet.empty() || !m_ipc) {
@@ -579,8 +550,7 @@ public:
     // NOTE: Prop_InterpretedAsOculus_Bool is not defined in the current OpenVR SDK.
     // VRProperties()->SetBoolProperty(container, Prop_InterpretedAsOculus_Bool,
     //                                 true);
-    VRProperties()->SetInt32Property(container, Prop_HmdTrackingStyle_Int32,
-                                     2); // Outside-in
+    // Prop_HmdTrackingStyle_Int32 is set below after the 3DoF comment.
     VRProperties()->SetBoolProperty(container, Prop_DeviceIsCharging_Bool,
                                     true);
     VRProperties()->SetBoolProperty(container,
@@ -611,21 +581,17 @@ public:
     // This HMD is currently 3DoF, so tell SteamVR not to expect full
     // positional inside-out tracking.
     VRProperties()->SetBoolProperty(container, Prop_WillDriftInYaw_Bool, true);
-    VRProperties()->SetBoolProperty(
-        container, Prop_DeviceProvidesBatteryStatus_Bool, true);
-    VRProperties()->SetFloatProperty(container, Prop_DeviceBatteryPercentage_Float, 1.0f);
-    VRProperties()->SetBoolProperty(container, Prop_DeviceIsCharging_Bool, true);
     VRProperties()->SetBoolProperty(container, Prop_DeviceIsWireless_Bool,
                                     true);
     VRProperties()->SetBoolProperty(container, Prop_DeviceCanPowerOff_Bool,
                                     false);
-    VRProperties()->SetBoolProperty(container, Prop_HasCamera_Bool, false);
     VRProperties()->SetBoolProperty(container,
                                     Prop_CanUnifyCoordinateSystemWithHmd_Bool,
                                     false);
 
     // Register proximity sensor to prevent standby
     RegisterInput("/proximity", opendriver::core::InputType::BOOLEAN);
+    UpdateInput("/proximity", 1.0f);
 
     if (VRDriverLog()) {
       char buf[192];
@@ -763,66 +729,35 @@ public:
       m_send_overwrite_frames = 0;
     }
     return;
-
-#elif defined(OD_PLATFORM_LINUX)
-    // ─── LINUX PIPELINE (CPU X264 + SWSCALE VIA DMABUF) ───────────────────
-#if !HAVE_X264
-    (void)pPresentInfo;
-    (void)unPresentInfoSize;
-    return;
-#endif
-    if (!m_is_encoder_ready || !m_encoder || !pPresentInfo)
-      return;
-    if (m_encoding_in_progress.exchange(true)) {
-      m_frames_dropped++;
-      return;
-    }
-
-    auto frame_start = std::chrono::steady_clock::now();
-
-    uint8_t *mapped_data = nullptr;
-    int mapped_stride = 0;
-
-    // ─── LINUX: DMABUF MMAP
-    // ───────────────────────────────────────────────────
-    int fd = (int)pPresentInfo->backbufferTextureHandle;
-    if (fd < 0) {
-      m_encoding_in_progress = false;
-      return;
-    }
-
-    size_t frame_size = width * height * 4; // RGBA
-
-    struct dma_buf_sync sync_start = {0};
-    sync_start.flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START;
-    if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_start) < 0) {
-    }
-
-    void *mapped = mmap(NULL, frame_size, PROT_READ, MAP_SHARED, fd, 0);
-    if (mapped == MAP_FAILED) {
-      struct dma_buf_sync sync_end = {0};
-      sync_end.flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END;
-      ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync_end);
-
-      m_mmap_failures++;
-      m_encoding_in_progress = false;
-      return;
-    }
-    mapped_data = (uint8_t *)mapped;
-    mapped_stride = (int)width * 4;
-
-#endif // OD_PLATFORM
-
+#endif  // OD_PLATFORM_WINDOWS
   } // Present()
 
   void WaitForPresent() override {
-    // Prosta symulacja VSync
+    // Use high-resolution timer to hit 90fps precisely.
+    // Windows default sleep granularity is ~15.6ms which caps us at ~64fps.
+    // timeBeginPeriod(1) reduces it to ~1ms, enough for 11ms frames.
+#if defined(OD_PLATFORM_WINDOWS)
+    static bool timer_set = false;
+    if (!timer_set) {
+      timeBeginPeriod(1);
+      timer_set = true;
+    }
+#endif
+
     auto target = std::chrono::microseconds((int)(1000000.0f / refresh_rate));
     auto now = std::chrono::steady_clock::now();
     auto elapsed = now - m_last_vsync;
 
     if (elapsed < target) {
-      std::this_thread::sleep_for(target - elapsed);
+      auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(target - elapsed);
+      // Sleep for most of the remaining time, leaving 1ms margin
+      if (remaining > std::chrono::microseconds(1500)) {
+        std::this_thread::sleep_for(remaining - std::chrono::microseconds(1500));
+      }
+      // Spin-wait only the last ~1.5ms for sub-ms precision
+      while (std::chrono::steady_clock::now() - m_last_vsync < target) {
+        _mm_pause(); // CPU-friendly spin hint (uses PAUSE instruction)
+      }
     }
     m_last_vsync = std::chrono::steady_clock::now();
   }
@@ -942,17 +877,7 @@ private:
   }
 
   IIPCClient *m_ipc = nullptr;
-#if HAVE_X264
-  x264_t *m_encoder = nullptr;
-  x264_picture_t m_pic_in = {};
-  x264_picture_t m_pic_out = {};
-  struct SwsContext *m_sws_ctx = nullptr;
-#else
-  void *m_encoder = nullptr;
-  void *m_sws_ctx = nullptr;
-#endif
   bool m_is_encoder_ready = false;
-  bool m_pic_allocated = false;
 
   // Frame pacing
   std::atomic<bool> m_encoding_in_progress{false};
@@ -978,11 +903,11 @@ private:
   void* m_last_texture_handle = nullptr;
   std::condition_variable m_send_cv;
   std::mutex m_send_mutex;
-  std::vector<uint8_t> m_pending_packet;
-  bool m_has_pending_packet = false;
+  std::deque<std::vector<uint8_t>> m_pending_packets;
   uint64_t m_send_overwrite_frames = 0;
   std::atomic<bool> m_reconfigure_requested{false};
   std::atomic<bool> m_video_thread_running{false};
+  static constexpr size_t kMaxPendingPackets = 4;
 };
 
 // ============================================================================
@@ -994,14 +919,8 @@ public:
   EVRInitError Init(IVRDriverContext *pDriverContext) override {
     VR_INIT_SERVER_DRIVER_CONTEXT(pDriverContext);
 
-#if defined(OD_PLATFORM_LINUX)
-    // CRITICAL: Disable LD_PRELOAD recursion — prevents error 303.
-    // The DRM lease shim is already loaded; don't inherit it in children.
-    unsetenv("LD_PRELOAD");
-#elif defined(OD_PLATFORM_WINDOWS)
-    // On Windows there is no LD_PRELOAD; nothing to clean up.
+    // On Windows there is no LD_PRELOAD to clean up.
     // SteamVR uses DLL injection differently and we don't need a shim.
-#endif
 
     if (VRDriverLog())
       VRDriverLog()->Log(
@@ -1173,9 +1092,24 @@ private:
                 VRDriverLog()->Log(buf);
               }
             } else {
-              if (data["type"] == 4)
+              if (data["type"] == 4) {
                 device_class = TrackedDeviceClass_Controller;
-              device = new COpenDriverDevice(serial);
+                const std::string lower_id =
+                    data.value("id", std::string());
+                const std::string lower_name =
+                    data.value("name", std::string());
+                const bool is_left =
+                    lower_id.find("left") != std::string::npos ||
+                    lower_name.find("Left") != std::string::npos ||
+                    lower_name.find("left") != std::string::npos;
+                device = new COpenDriverController(serial, is_left);
+              } else {
+                const std::string model =
+                    data.value("name", std::string("OpenDriver Modular Device"));
+                const std::string manufacturer = data.value(
+                    "manufacturer", std::string("OpenDriver Project"));
+                device = new COpenDriverDevice(serial, model, manufacturer);
+              }
             }
 
             devices[serial] = device;
@@ -1348,20 +1282,8 @@ private:
     std::string runner_path = "opendriver_runner";
     std::string bin_dir;
 
-    // Locate opendriver_runner next to this shared library
-#if defined(OD_PLATFORM_LINUX) || defined(OD_PLATFORM_MACOS)
-    // POSIX: use dladdr() to find our own .so path
-    Dl_info info{};
-    if (dladdr(reinterpret_cast<void *>(HmdDriverFactory), &info) &&
-        info.dli_fname) {
-      fs::path so_path(info.dli_fname);
-      bin_dir = so_path.parent_path().string();
-      fs::path local_runner = so_path.parent_path() / "opendriver_runner";
-      if (fs::exists(local_runner))
-        runner_path = fs::absolute(local_runner).string();
-    }
-#elif defined(OD_PLATFORM_WINDOWS)
-    // Windows: use GetModuleHandleEx to find our own DLL path
+    // Locate opendriver_runner next to this shared library.
+    // Windows: use GetModuleHandleEx to find our own DLL path.
     HMODULE hmod = nullptr;
     if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1376,7 +1298,6 @@ private:
           runner_path = fs::absolute(local_runner).string();
       }
     }
-#endif
 
     // Guard: only spawn if not already running
     if (runner_process.valid && IsProcessRunning(runner_process)) {

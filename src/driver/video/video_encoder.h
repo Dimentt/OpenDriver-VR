@@ -42,6 +42,7 @@ public:
 // Factory methods
 #if defined(_WIN32) || defined(WIN32)
 std::unique_ptr<IVideoEncoder> CreateMediaFoundationEncoder();
+std::unique_ptr<IVideoEncoder> CreateNvencEncoder();
 #endif
 
 // Fallback/Linux CPU encoder

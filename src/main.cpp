@@ -14,6 +14,20 @@
 using namespace opendriver::core;
 namespace fs = std::filesystem;
 
+namespace {
+
+float ResolveTickRateHz(Runtime& runtime) {
+    float tick_rate_hz = runtime.GetConfig().GetFloat("runtime.tick_rate_hz", 90.0f);
+    if (tick_rate_hz < 30.0f) {
+        tick_rate_hz = 30.0f;
+    } else if (tick_rate_hz > 240.0f) {
+        tick_rate_hz = 240.0f;
+    }
+    return tick_rate_hz;
+}
+
+} // namespace
+
 // ============================================================================
 // Signal handling — cross-platform graceful shutdown
 // ============================================================================
@@ -105,15 +119,41 @@ int main(int argc, char* argv[]) {
     app.setApplicationName("OpenDriver");
     app.setApplicationVersion("0.2.0");
 
-    // Start background thread for VR polling while GUI runs on main thread
+    // Run the core loop on a steady cadence so plugin ticks stay responsive enough for VR.
     std::thread runner_thread([&]() {
-        auto prev = std::chrono::steady_clock::now();
+        using clock = std::chrono::steady_clock;
+        const float tick_rate_hz = ResolveTickRateHz(Runtime::GetInstance());
+        const auto target_frame = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::duration<double>(1.0 / static_cast<double>(tick_rate_hz)));
+
+        std::cout << "[OpenDriver] Runtime tick rate: " << tick_rate_hz << " Hz" << std::endl;
+
+        auto prev = clock::now();
+        auto next_tick = prev + target_frame;
+
         while (!g_shutdown_requested) {
-            auto now = std::chrono::steady_clock::now();
+            auto now = clock::now();
             float dt = std::chrono::duration<float>(now - prev).count();
             prev = now;
+
+            if (dt < 0.0f) {
+                dt = 0.0f;
+            } else if (dt > 0.1f) {
+                // Clamp long stalls so one hitch does not destabilize plugin timing.
+                dt = 0.1f;
+            }
+
             Runtime::GetInstance().Tick(dt);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            now = clock::now();
+            if (now < next_tick) {
+                std::this_thread::sleep_until(next_tick);
+                next_tick += target_frame;
+            } else {
+                // If we fall behind, realign from the current time instead of accumulating drift.
+                next_tick = now + target_frame;
+                std::this_thread::yield();
+            }
         }
     });
 

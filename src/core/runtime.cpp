@@ -310,6 +310,15 @@ std::vector<PluginLoader::AvailablePlugin> Runtime::GetAvailablePlugins() {
 
 bool Runtime::EnablePlugin(const std::string& name) {
     try {
+        ScanPlugins();
+        config_manager.SetPluginEnabled(name, true);
+        config_manager.Save();
+
+        if (plugin_loader.IsLoaded(name)) {
+            ScanPlugins();
+            return true;
+        }
+
         auto available = GetAvailablePlugins();
         for (auto& ap : available) {
             if (ap.name == name) {
@@ -321,23 +330,54 @@ bool Runtime::EnablePlugin(const std::string& name) {
                     if (!entry_point.empty()) {
                         fs::path plugin_file = fs::path(ap.path) / entry_point;
                         if (fs::exists(plugin_file)) {
-                            return plugin_loader.Load(plugin_file.string());
+                            bool loaded = plugin_loader.Load(plugin_file.string());
+                            ScanPlugins();
+                            return loaded;
                         }
                     }
                 }
             }
         }
+        ScanPlugins();
         return false;
     } catch (...) { return false; }
 }
 
 bool Runtime::DisablePlugin(const std::string& name) {
-    return plugin_loader.Unload(name);
+    try {
+        config_manager.SetPluginEnabled(name, false);
+        config_manager.Save();
+
+        if (plugin_loader.IsLoaded(name)) {
+            bool unloaded = plugin_loader.Unload(name);
+            ScanPlugins();
+            return unloaded;
+        }
+
+        ScanPlugins();
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 void Runtime::SetAllPluginsState(bool enabled) {
-    if (!enabled) plugin_loader.UnloadAll();
-    else ReloadPlugins();
+    try {
+        ScanPlugins();
+        auto available = plugin_loader.GetAvailablePlugins();
+        for (const auto& ap : available) {
+            config_manager.SetPluginEnabled(ap.name, enabled);
+        }
+        config_manager.Save();
+
+        if (!enabled) {
+            plugin_loader.UnloadAll();
+        } else {
+            ReloadPlugins();
+        }
+
+        ScanPlugins();
+    } catch (...) {}
 }
 
 } // namespace opendriver::core
