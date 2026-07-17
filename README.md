@@ -66,24 +66,20 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1 -BuildRelease
 
 ---
 
-## Changelog / Project State (July 2026)
+## Changelog / Project State
 
 ### ✅ Implemented
-- **Runtime**: Full lifecycle support (initialization, tick loop, shutdown).
+- **Runtime**: Full lifecycle support (initialization, tick loop, shutdown) with precise tick rate pacing.
 - **EventBus & DeviceRegistry**: Operational pub/sub system and VR device registration flow.
-- **ConfigManager & Logger**: Working JSON configuration and spdlog wrapper with rolling buffer.
+- **ConfigManager & Logger**: Working JSON configuration and spdlog wrapper with rolling buffer. Config paths correctly resolve to `APPDATA` on Windows and `~/.config` on Linux.
 - **IPC**: Fully implemented with Named Pipes (Windows) and Unix Sockets (Linux).
 - **SteamVR Driver**: Complete `driver_opendriver.cpp` containing `ITrackedDeviceServerDriver`, `IVRDisplayComponent`, and `IVRVirtualDisplay` implementations.
-- **Windows Video Pipeline**: DX11 to Media Foundation H.264 is fully working, featuring adaptive bitrate, and background encoding/sending threads.
+- **Windows Video Pipeline**: Highly optimized zero-copy D3D11 hardware encoding pipeline. Features fully implemented **Nvidia NVENC** encoding via nvEncodeAPI, with seamless fallback to **Media Foundation H.264**. Includes adaptive bitrate and telemetry logging.
 
 ### 🔴 Known Bugs & Critical Issues
-- **Linux `Present()` Incomplete**: The code for the Linux presentation pipeline is cut off in the middle. The DMA-BUF map is received, but encoding via x264 and IPC dispatch are missing.
-- **`LoadVideoConfig()` on Windows**: Currently searches for the config directory in `HOME` instead of `APPDATA`, causing the video config to never load properly on Windows.
 - **Duplicate Properties**: Some SteamVR properties (e.g., `Prop_HmdTrackingStyle_Int32`, `Prop_DeviceBatteryPercentage_Float`) are being set multiple times incorrectly during device activation.
 
 ### 🟡 Work in Progress / To Do
-- **Linux Encoding**: Implement the missing `x264_encoder_encode` call, `sws_scale` mapping, and `m_ipc->Send()` for Linux frames.
-- **NVENC Encoder**: Implement the currently empty `nvenc_encoder.h` placeholder to support Nvidia GPU hardware encoding.
-- **Code Refactoring**: Extract the inline x264 encoder into a separate class implementing `IVideoEncoder` (similar to how `MediaFoundationEncoder` is handled).
+- **Linux Video Pipeline**: The Linux `Present()` implementation is currently stubbed out entirely. Needs a software (e.g., x264 via DMA-BUF) or hardware encoding path to be written from scratch.
 - **Input Bindings**: Verify the existence and formatting of `opendriver_hmd_profile.json` required by SteamVR.
 - **Qt Resources**: Review `resources.qrc` as it may be referencing missing iconography.
