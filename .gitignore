@@ -1,8 +1,11 @@
 build/
 build-strict/
+build-ktrack/
+build-ktrack-test/
+build-virtual-controllers/
+plugins/
 android/
 logs/
-driver/bin/
 *.user
 .vs/
 .vscode/

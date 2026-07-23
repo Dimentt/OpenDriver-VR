@@ -68,11 +68,11 @@ public:
     // PLUGIN SPECIFIC CONFIG
     // ────────────────────────────────────────────────────────────────────
 
-    /// Pobranie config dla konkretnego pluginu (kopia)
-    /// Zwraca pusty obiekt jeśli plugin nie istnieje w configu
+    /// Pobranie kopii configu dla konkretnego pluginu
+    /// Zwraca JSON node: config["plugins"][plugin_name]
     json GetPluginConfig(const std::string& plugin_name) const;
 
-    /// Ustaw/zastąp config dla konkretnego pluginu
+    /// Nadpisuje cały config konkretnego pluginu
     void SetPluginConfig(const std::string& plugin_name, const json& plugin_config);
 
     /// Czy plugin jest enabled?

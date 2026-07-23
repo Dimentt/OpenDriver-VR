@@ -183,6 +183,8 @@ private:
             had_clients = has_clients_now;
             
             IPCMessage msg;
+            std::vector<uint8_t> latest_video_packet;
+            bool have_latest_video_packet = false;
             while (ipc_server->Receive(msg, 0)) {  // drain all available
                 switch (msg.type) {
                     case IPCMessageType::HAPTIC_EVENT: {
@@ -204,25 +206,30 @@ private:
                         // separate DLLs can std::any_cast it without
                         // RTTI conflicts (see VideoFrameData docs).
                         // ═══════════════════════════════════════════
-                        video_frame_count++;
-                        video_byte_count += msg.data.size();
-                        fps_frame_counter++;
-
-                        VideoFrameData frame;
-                        frame.nal_data = std::move(msg.data);
-                        frame.frame_number = video_frame_count;
-                        frame.pts = std::chrono::steady_clock::now()
-                                        .time_since_epoch().count();
-
-                        Event evt(EventType::VIDEO_FRAME, "bridge");
-                        evt.data = frame.Serialize();
-                        event_bus.Publish(evt);
+                        latest_video_packet = std::move(msg.data);
+                        have_latest_video_packet = true;
                         break;
                     }
 
                     default:
                         break;
                 }
+            }
+
+            if (have_latest_video_packet) {
+                video_frame_count++;
+                video_byte_count += latest_video_packet.size();
+                fps_frame_counter++;
+
+                VideoFrameData frame;
+                frame.nal_data = std::move(latest_video_packet);
+                frame.frame_number = video_frame_count;
+                frame.pts = std::chrono::steady_clock::now()
+                                .time_since_epoch().count();
+
+                Event evt(EventType::VIDEO_FRAME, "bridge");
+                evt.data = frame.Serialize();
+                event_bus.Publish(evt);
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
 

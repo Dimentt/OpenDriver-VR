@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(OPENDRIVER_BUILD_GUI "Build Qt-based runner/dashboard" ON)
+option(OPENDRIVER_BUILD_INSTALLER "Build Qt-based graphical installer" ON)
 option(OPENDRIVER_ENABLE_LINUX_VIDEO "Build Linux x264/FFmpeg video path" ON)
 option(OPENDRIVER_STRICT "Treat warnings as errors for OpenDriver targets" OFF)
 
@@ -34,13 +35,13 @@ else()
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Qt6 Configuration (GUI only)
+# Qt6 Configuration (GUI & Installer)
 # ─────────────────────────────────────────────────────────────────────────────
-if(OPENDRIVER_BUILD_GUI)
+if(OPENDRIVER_BUILD_GUI OR OPENDRIVER_BUILD_INSTALLER)
     set(CMAKE_AUTOMOC ON)
     set(CMAKE_AUTOUIC ON)
     set(CMAKE_AUTORCC ON)
-    find_package(Qt6 COMPONENTS Widgets REQUIRED)
+    find_package(Qt6 COMPONENTS Widgets Network REQUIRED)
 endif()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,8 +62,7 @@ FetchContent_MakeAvailable(json)
 # spdlog
 FetchContent_Declare(
     spdlog
-    URL https://github.com/gabime/spdlog/archive/refs/tags/v1.11.0.tar.gz
-    URL_HASH SHA256=ca5cae8d6cac15dae0ec63b21d6ad3530070650f68076f3a4a862ca293a858bb
+    URL https://github.com/gabime/spdlog/archive/refs/tags/v1.14.1.tar.gz
 )
 FetchContent_MakeAvailable(spdlog)
 
@@ -151,7 +151,7 @@ set(CORE_SOURCES
     src/core/config_manager.cpp
     src/core/plugin_loader.cpp
     src/core/runtime.cpp
-    src/core/ipc_platform.cpp   # replaces ipc_linux.cpp
+    src/core/ipc_platform.cpp
     src/core/process_utils.cpp
 )
 
@@ -172,7 +172,6 @@ if(OD_PLATFORM_LINUX OR OD_PLATFORM_MACOS)
 endif()
 
 if(OD_PLATFORM_WINDOWS)
-    # ws2_32 needed for Winsock if ever used; no extra link needed for named pipes
     target_compile_definitions(opendriver_core PUBLIC
         WIN32_LEAN_AND_MEAN
         NOMINMAX
@@ -211,6 +210,17 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME test_config_manager COMMAND test_config_manager)
 
+    add_executable(test_plugin_loader_config tests/test_plugin_loader_config.cpp)
+    target_link_libraries(test_plugin_loader_config PRIVATE opendriver_core)
+    if(OPENDRIVER_STRICT)
+        if(MSVC)
+            target_compile_options(test_plugin_loader_config PRIVATE /W4 /WX)
+        else()
+            target_compile_options(test_plugin_loader_config PRIVATE -Wall -Wextra -Wpedantic -Werror)
+        endif()
+    endif()
+    add_test(NAME test_plugin_loader_config COMMAND test_plugin_loader_config)
+
     if(OD_PLATFORM_WINDOWS)
         add_executable(test_mf_color_convert
             tests/test_mf_color_convert.cpp
@@ -246,6 +256,9 @@ if(BUILD_TESTING)
         add_executable(test_plugin_loader_tick tests/test_plugin_loader_tick.cpp)
         target_link_libraries(test_plugin_loader_tick PRIVATE opendriver_core)
         add_dependencies(test_plugin_loader_tick crash_tick_plugin)
+        target_compile_definitions(test_plugin_loader_tick PRIVATE
+            TEST_CRASH_TICK_PLUGIN_PATH="$<TARGET_FILE:crash_tick_plugin>"
+        )
         if(OPENDRIVER_STRICT)
             if(MSVC)
                 target_compile_options(test_plugin_loader_tick PRIVATE /W4 /WX)
@@ -256,12 +269,6 @@ if(BUILD_TESTING)
         add_test(NAME test_plugin_loader_tick COMMAND test_plugin_loader_tick)
     endif()
 endif()
-
-# ----------------------------------------------------------------------------
-# BUILT-IN TEST PLUGINS
-# ----------------------------------------------------------------------------
-
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RUNNER EXECUTABLE (with embedded GUI)
@@ -293,14 +300,14 @@ if(OPENDRIVER_BUILD_GUI)
 
         add_custom_command(TARGET opendriver_runner POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${QT_BIN_DIR}/Qt6Core.dll"
-                "${QT_BIN_DIR}/Qt6Gui.dll"
-                "${QT_BIN_DIR}/Qt6Widgets.dll"
+                "${QT_BIN_DIR}/Qt6Core$<IF:$<CONFIG:Debug>,d,>.dll"
+                "${QT_BIN_DIR}/Qt6Gui$<IF:$<CONFIG:Debug>,d,>.dll"
+                "${QT_BIN_DIR}/Qt6Widgets$<IF:$<CONFIG:Debug>,d,>.dll"
                 "$<TARGET_FILE_DIR:opendriver_runner>"
             COMMAND ${CMAKE_COMMAND} -E make_directory
                 "$<TARGET_FILE_DIR:opendriver_runner>/platforms"
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${QT_PLUGINS_DIR}/platforms/qwindows.dll"
+                "${QT_PLUGINS_DIR}/platforms/qwindows$<IF:$<CONFIG:Debug>,d,>.dll"
                 "$<TARGET_FILE_DIR:opendriver_runner>/platforms"
             COMMENT "Deploying Qt runtime dependencies for opendriver_runner"
         )
@@ -379,10 +386,15 @@ if(OD_PLATFORM_WINDOWS)
         WINDOWS_EXPORT_ALL_SYMBOLS FALSE  # Only export explicitly marked symbols
     )
     
-    # Add Media Foundation Hardware Encoder sources
+    # Add Media Foundation and NVENC Hardware Encoder sources
     target_sources(driver_opendriver PRIVATE
         src/driver/video/mf_encoder.cpp
         src/driver/video/mf_color_convert.cpp
+        src/driver/video/nvenc_encoder.cpp
+    )
+    
+    target_include_directories(driver_opendriver PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nvenc/include
     )
 
     # Do not use PIC on Windows
@@ -430,6 +442,54 @@ endif()
 message(STATUS "GUI dashboard: ${OPENDRIVER_BUILD_GUI}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# INSTALLER (requires Qt6 Widgets & Network)
+# ─────────────────────────────────────────────────────────────────────────────
+message(STATUS "GUI installer: ${OPENDRIVER_BUILD_INSTALLER}")
+
+if(OPENDRIVER_BUILD_INSTALLER)
+    add_executable(opendriver_installer 
+        src/installer/main.cpp
+        src/installer/installer_window.cpp
+        src/ui/resources.qrc
+    )
+    
+    set_target_properties(opendriver_installer PROPERTIES 
+        AUTOMOC ON 
+        AUTOUIC ON
+        AUTORCC ON
+    )
+    target_include_directories(opendriver_installer PRIVATE src)
+    target_link_libraries(opendriver_installer PRIVATE Qt6::Widgets Qt6::Network)
+
+    if(OD_PLATFORM_WINDOWS)
+        set_target_properties(opendriver_installer PROPERTIES WIN32_EXECUTABLE TRUE)
+        get_filename_component(QT_DEPLOY_PREFIX "${Qt6_DIR}/../../.." ABSOLUTE)
+        set(QT_BIN_DIR "${QT_DEPLOY_PREFIX}/bin")
+        set(QT_PLUGINS_DIR "${QT_DEPLOY_PREFIX}/plugins")
+
+        add_custom_command(TARGET opendriver_installer POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${QT_BIN_DIR}/Qt6Core$<IF:$<CONFIG:Debug>,d,>.dll"
+                "${QT_BIN_DIR}/Qt6Gui$<IF:$<CONFIG:Debug>,d,>.dll"
+                "${QT_BIN_DIR}/Qt6Widgets$<IF:$<CONFIG:Debug>,d,>.dll"
+                "${QT_BIN_DIR}/Qt6Network$<IF:$<CONFIG:Debug>,d,>.dll"
+                "$<TARGET_FILE_DIR:opendriver_installer>"
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:opendriver_installer>/platforms"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${QT_PLUGINS_DIR}/platforms/qwindows$<IF:$<CONFIG:Debug>,d,>.dll"
+                "$<TARGET_FILE_DIR:opendriver_installer>/platforms"
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_FILE_DIR:opendriver_installer>/tls"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${QT_PLUGINS_DIR}/tls/qschannelbackend$<IF:$<CONFIG:Debug>,d,>.dll"
+                "$<TARGET_FILE_DIR:opendriver_installer>/tls"
+            COMMENT "Deploying Qt runtime dependencies for opendriver_installer"
+        )
+    endif()
+endif()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # INSTALL RULES
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -458,6 +518,7 @@ message(STATUS "  Platform       : ${CMAKE_SYSTEM_NAME}")
 message(STATUS "  C++ Standard   : C++${CMAKE_CXX_STANDARD}")
 message(STATUS "  Video encode   : ${HAVE_VIDEO_ENCODE}")
 message(STATUS "  GUI (Qt6)      : ${OPENDRIVER_BUILD_GUI}")
+message(STATUS "  Installer      : ${OPENDRIVER_BUILD_INSTALLER}")
 message(STATUS "  DRM shim       : ${OD_PLATFORM_LINUX}")
 message(STATUS "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 message(STATUS "")

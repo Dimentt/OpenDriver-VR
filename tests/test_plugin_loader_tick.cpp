@@ -62,7 +62,7 @@ int main() {
     PluginErrorListener listener;
     context.event_bus.Subscribe(EventType::PLUGIN_ERROR, &listener);
 
-    const fs::path plugin_path = fs::current_path() / "Release" / "crash_tick_plugin.dll";
+    const fs::path plugin_path = TEST_CRASH_TICK_PLUGIN_PATH;
     assert(fs::exists(plugin_path));
     assert(loader.Load(plugin_path.string()));
     assert(loader.GetCount() == 1);

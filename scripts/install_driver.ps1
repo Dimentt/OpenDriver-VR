@@ -28,6 +28,14 @@ function Resolve-SteamVRPath {
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectRoot = (Resolve-Path (Join-Path $scriptDir "..")).Path
+$buildDirs = @(
+    (Join-Path $projectRoot "build-clean"),
+    (Join-Path $projectRoot "build")
+)
+$buildDir = $buildDirs | Where-Object { Test-Path (Join-Path $_ "CMakeCache.txt") } | Select-Object -First 1
+if (-not $buildDir) {
+    $buildDir = Join-Path $projectRoot "build"
+}
 $driverDir = Join-Path $projectRoot "driver"
 $driverDll = Join-Path $driverDir "bin\win64\driver_opendriver.dll"
 $runnerExe = Join-Path $driverDir "bin\win64\opendriver_runner.exe"
@@ -48,7 +56,8 @@ $hmdekInstallDir = Join-Path $configDir "plugins\hmdek"
 
 if ($BuildRelease) {
     Write-Host "Building Release configuration..."
-    & cmake --build (Join-Path $projectRoot "build") --config Release --parallel
+    $env:QTFRAMEWORK_BYPASS_LICENSE_CHECK="1"
+    & cmake --build $buildDir --config Release --parallel
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed."
     }

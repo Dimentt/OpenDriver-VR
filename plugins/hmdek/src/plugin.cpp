@@ -123,20 +123,20 @@ bool AndroidHmdPlugin::OnInitialize(opendriver::core::IPluginContext* context) {
         m_context->LogInfo(ss.str().c_str());
     }
 
-    // ── 6. Uruchom TCP video sender ────────────────────────────────────
-    if (!m_tcp.Start(m_tcp_port, m_display_w, m_display_h, m_refresh_rate)) {
-        m_context->LogError("[android_hmd] Failed to start TCP video server");
+    // ── 6. Uruchom UDP video sender ────────────────────────────────────
+    if (!m_udp_video.Start(m_video_port, m_display_w, m_display_h, m_refresh_rate)) {
+        m_context->LogError("[android_hmd] Failed to start UDP video sender");
         m_udp.Stop();
         return false;
     }
-    m_tcp.SetLogger([this](const std::string& message) {
+    m_udp_video.SetLogger([this](const std::string& message) {
         if (m_context) {
             m_context->LogInfo(message.c_str());
         }
     });
     {
         std::ostringstream ss;
-        ss << "[android_hmd] TCP video sender ready for port " << m_tcp_port;
+        ss << "[android_hmd] UDP video sender ready for port " << m_video_port;
         m_context->LogInfo(ss.str().c_str());
     }
 
@@ -152,7 +152,7 @@ void AndroidHmdPlugin::OnShutdown() {
     m_context->GetEventBus().Unsubscribe(opendriver::core::EventType::VIDEO_FRAME, this);
 
     m_udp.Stop();
-    m_tcp.Stop();
+    m_udp_video.Stop();
 
     m_context->UnregisterDevice(m_device_id.c_str());
 
@@ -169,14 +169,14 @@ void AndroidHmdPlugin::OnShutdown() {
 void AndroidHmdPlugin::LoadConfig() {
     m_device_id    = GetConfigString("device_id", "android_hmd_001");
     m_udp_port     = static_cast<uint16_t>(GetConfigInt("udp_port", 6969));
-    m_tcp_port     = static_cast<uint16_t>(GetConfigInt("tcp_port", 6970));
+    m_video_port   = static_cast<uint16_t>(GetConfigInt("video_port", 6970));
     m_display_w    = static_cast<uint32_t>(GetConfigInt("display_width", 1920));
     m_display_h    = static_cast<uint32_t>(GetConfigInt("display_height", 1080));
     m_refresh_rate = GetConfigFloat("refresh_rate", 90.0f);
     m_fov          = GetConfigFloat("fov", 100.0f);
 
     m_pose_cfg.sensor_hz        = GetConfigFloat("sensor_hz", 90.0f);
-    m_pose_cfg.pitch_offset_deg = GetConfigFloat("pitch_offset_deg", -90.0f);
+    m_pose_cfg.pitch_offset_deg = GetConfigFloat("pitch_offset_deg", 0.0f);
     m_pose_cfg.ema_alpha_pos    = GetConfigFloat("ema_alpha_pos", 0.35f);
     m_pose_cfg.ema_alpha_rot    = GetConfigFloat("ema_alpha_rot", 0.45f);
     m_pose_cfg.ema_alpha_vel    = GetConfigFloat("ema_alpha_vel", 0.35f);
@@ -232,9 +232,9 @@ void AndroidHmdPlugin::OnTick(float /*delta_time*/) {
 
     TrackingPose raw_pose;
     if (!m_udp.GetLatestPose(raw_pose)) {
-        // Brak nowego pakietu — UpdatePose z poprzednią pozą (SteamVR tego wymaga)
-        // Processor pamięta ostatnią wygładzoną pozę — wyślij ją ponownie z zerowymi velocity
-        // (wystarczy; SteamVR sam ekstrapoluje na podstawie poprzednich prędkości)
+        // Brak nowego pakietu — po prostu ignorujemy klatkę. 
+        // SteamVR sam ekstrapoluje sobie braki (lub OpenDriver),
+        // wysyłanie sztucznych duplikatów zatykało kolejkę IPC.
         return;
     }
 
@@ -247,7 +247,7 @@ void AndroidHmdPlugin::OnTick(float /*delta_time*/) {
                << " (video target updated)";
             m_context->LogInfo(ss.str().c_str());
         }
-        m_tcp.UpdateRemoteHost(sender_ip);
+        m_udp_video.UpdateRemoteHost(sender_ip);
     }
 
     // Oblicz prędkości, wygładź, zastosuj offsets
@@ -262,17 +262,20 @@ void AndroidHmdPlugin::OnTick(float /*delta_time*/) {
         final_pose.angVelX, final_pose.angVelY, final_pose.angVelZ
     );
 
+    m_last_sent_pose = final_pose;
+    m_has_last_sent_pose = true;
+
     // Odśwież statystyki UI (nie co klatkę — za wolno dla Qt; co ~100ms wystarczy)
     static int tick_counter = 0;
     if (++tick_counter >= 9) {  // ~90Hz / 9 = ~10x/s
         tick_counter = 0;
         HmdUIProvider::Stats stats;
         stats.tracking_hz  = m_udp.GetHz();
-        stats.video_fps    = m_tcp.GetSentFPS();
+        stats.video_fps    = m_udp_video.GetSentFPS();
         stats.udp_packets  = m_udp.GetPacketCount();
         stats.udp_dropped  = m_udp.GetDroppedCount();
-        stats.tcp_clients  = m_tcp.GetClientCount();
-        stats.sent_bytes   = m_tcp.GetSentBytes();
+        stats.video_clients= m_udp_video.GetClientCount();
+        stats.sent_bytes   = m_udp_video.GetSentBytes();
         stats.is_active    = m_active.load();
         stats.status       = GetStatus();
         m_ui.UpdateStats(stats);
@@ -403,7 +406,7 @@ void AndroidHmdPlugin::OnEvent(const opendriver::core::Event& event) {
 
     const auto sequence_header = ExtractSequenceHeaderAnnexB(frame_data.nal_data);
     if (!sequence_header.empty()) {
-        m_tcp.UpdateSequenceHeader(sequence_header);
+        m_udp_video.UpdateSequenceHeader(sequence_header);
     }
 
     const bool is_keyframe = ContainsIdr(frame_data.nal_data);
@@ -414,11 +417,11 @@ void AndroidHmdPlugin::OnEvent(const opendriver::core::Event& event) {
         ss << "[android_hmd] VIDEO_FRAME received #" << m_video_frames_seen
            << " size=" << frame_data.nal_data.size()
            << " keyframe=" << (is_keyframe ? "yes" : "no")
-           << " clients=" << m_tcp.GetClientCount();
+           << " clients=" << m_udp_video.GetClientCount();
         m_context->LogInfo(ss.str().c_str());
     }
 
-    m_tcp.EnqueueFrame(frame_data.nal_data, frame_data.frame_number,
+    m_udp_video.EnqueueFrame(frame_data.nal_data, frame_data.frame_number,
                        frame_data.pts, is_keyframe);
 }
 
@@ -430,15 +433,15 @@ std::string AndroidHmdPlugin::GetStatus() const {
     std::ostringstream ss;
     ss << std::fixed << std::setprecision(1);
     ss << "Tracking: " << m_udp.GetHz()         << " Hz\n";
-    ss << "Video:    " << m_tcp.GetSentFPS()     << " FPS\n";
-    ss << "Clients:  " << m_tcp.GetClientCount() << "\n";
+    ss << "Video:    " << m_udp_video.GetSentFPS()     << " FPS\n";
+    ss << "Clients:  " << m_udp_video.GetClientCount() << "\n";
     ss << "Packets:  " << m_udp.GetPacketCount() << "\n";
     ss << "Dropped:  " << m_udp.GetDroppedCount() << "\n";
     ss << "Sent:     "
        << std::setprecision(2)
-       << (m_tcp.GetSentBytes() / (1024.0 * 1024.0)) << " MB\n";
+       << (m_udp_video.GetSentBytes() / (1024.0 * 1024.0)) << " MB\n";
     ss << "UDP port: " << m_udp_port << "\n";
-    ss << "TCP port: " << m_tcp_port << "\n";
+    ss << "Video port: " << m_video_port << "\n";
     return ss.str();
 }
 
@@ -454,7 +457,7 @@ struct PluginState {
 void* AndroidHmdPlugin::ExportState() {
     auto* state          = new PluginState;
     state->udp_packet_count = m_udp.GetPacketCount();
-    state->sent_bytes       = m_tcp.GetSentBytes();
+    state->sent_bytes       = m_udp_video.GetSentBytes();
     return state;
 }
 

@@ -296,7 +296,7 @@ void HmdUIProvider::RefreshUI() {
         fps->setText(QString("FPS: %1 fps").arg(stats.video_fps, 0, 'f', 1));
     }
     if (clients) {
-        clients->setText(QString("Clients: %1").arg(stats.tcp_clients));
+        clients->setText(QString("Clients: %1").arg(stats.video_clients));
     }
     if (sent) {
         sent->setText(QString("Sent: %1 MB").arg(stats.sent_bytes / (1024.0 * 1024.0), 0, 'f', 2));

@@ -98,38 +98,37 @@ private:
 };
 
 // ============================================================================
-// TCP VIDEO SENDER
+// UDP VIDEO SENDER
 // ============================================================================
 
-struct VideoMessageHeader {
+struct UdpVideoPacketHeader {
     uint32_t magic = 0x4F445631; // "ODV1"
     uint32_t type = 0;
+    uint64_t frame_num = 0;
+    uint32_t fragment_index = 0;
+    uint32_t fragment_count = 0;
     uint32_t payload_size = 0;
-    uint32_t reserved = 0;
+    uint32_t flags = 0;
 };
-static_assert(sizeof(VideoMessageHeader) == 16, "VideoMessageHeader must be 16 bytes");
+static_assert(sizeof(UdpVideoPacketHeader) == 32, "UdpVideoPacketHeader must be 32 bytes");
 
-class TcpVideoSender {
+class UdpVideoSender {
 public:
-    TcpVideoSender() = default;
-    ~TcpVideoSender() { Stop(); }
+    UdpVideoSender() = default;
+    ~UdpVideoSender() { Stop(); }
 
-    // Uruchom nadawcę TCP. Połączenie do telefonu zostanie zestawione po
-    // wykryciu jego IP z pakietów UDP.
     bool Start(uint16_t port, uint32_t width, uint32_t height, float refresh_rate);
     void Stop();
     void UpdateRemoteHost(const std::string& host);
 
-    // Wysyła ramkę do wszystkich podłączonych klientów
     void EnqueueFrame(std::vector<uint8_t> nal_data, uint64_t frame_num,
                       uint64_t pts, bool is_keyframe);
 
-    // Zapamiętuje SPS/PPS dla nowych klientów
     void UpdateSequenceHeader(const std::vector<uint8_t>& header);
     void SetLogger(std::function<void(const std::string&)> logger) { m_logger = std::move(logger); }
 
-    bool HasClients() const { return m_client_count.load() > 0; }
-    int  GetClientCount() const { return m_client_count.load(); }
+    bool HasClients() const { return m_remote_host_known.load(); }
+    int  GetClientCount() const { return m_remote_host_known.load() ? 1 : 0; }
     uint64_t GetSentBytes() const { return m_sent_bytes.load(); }
     float    GetSentFPS() const { return m_sent_fps.load(); }
 
@@ -142,12 +141,8 @@ private:
     };
 
     void SendLoop();
-    bool EnsureConnectedLocked();
-    void DisconnectLocked();
-    bool SendConfigLocked();
-    bool SendFrameLocked(const PendingFrame& frame);
-    bool SendMessageLocked(uint32_t type, const void* payload, size_t len);
-    bool SendAll(socket_t sock, const void* data, size_t len);
+    void SendFragmented(const PendingFrame& frame);
+    void SendConfig();
 
     socket_t          m_sock = INVALID_SOCK;
     std::thread       m_send_thread;
@@ -155,24 +150,26 @@ private:
 
     mutable std::mutex          m_conn_mutex;
     std::string                 m_remote_host;
+    struct sockaddr_in          m_remote_addr{};
+    std::atomic<bool>           m_remote_host_known{false};
     bool                        m_sent_config = false;
-    std::atomic<int>            m_client_count{0};
 
     mutable std::mutex          m_queue_mutex;
     std::condition_variable     m_queue_cv;
     std::deque<PendingFrame>    m_queue;
-    static constexpr size_t     MAX_QUEUE = 3;
+    static constexpr size_t     MAX_QUEUE = 1;
 
     uint16_t                  m_port = 0;
     uint32_t                  m_width = 0;
     uint32_t                  m_height = 0;
     float                     m_refresh_rate = 90.0f;
-    std::vector<uint8_t>      m_sequence_header; // SPS/PPS cache
+    std::vector<uint8_t>      m_sequence_header;
     mutable std::mutex        m_header_mutex;
     std::function<void(const std::string&)> m_logger;
 
     std::atomic<uint64_t>     m_sent_bytes{0};
     std::atomic<float>        m_sent_fps{0.0f};
+    std::vector<uint8_t>      m_send_packet; // reusable buffer for SendFragmented
 };
 
 // ============================================================================
@@ -238,7 +235,7 @@ public:
         float refresh_rate = 90.0f;
         float fov = 100.0f;
         float sensor_hz = 90.0f;
-        float pitch_offset_deg = -90.0f;
+        float pitch_offset_deg = 0.0f;
         float ema_alpha_rot = 0.45f;
     };
 
@@ -247,7 +244,7 @@ public:
         float   video_fps     = 0.0f;
         uint64_t udp_packets  = 0;
         uint64_t udp_dropped  = 0;
-        int     tcp_clients   = 0;
+        int     video_clients   = 0;
         uint64_t sent_bytes   = 0;
         bool    is_active     = false;
         std::string status;
@@ -347,15 +344,17 @@ private:
 
     // Sub-systems
     UdpTrackingReceiver m_udp;
-    TcpVideoSender      m_tcp;
+    UdpVideoSender      m_udp_video;
     PoseProcessor*      m_processor = nullptr;
     HmdUIProvider       m_ui;
     std::string         m_last_video_sender_ip;
     uint64_t            m_video_frames_seen = 0;
+    TrackingPose        m_last_sent_pose;
+    bool                m_has_last_sent_pose = false;
 
     // Config
     uint16_t    m_udp_port      = 6969;
-    uint16_t    m_tcp_port      = 6970;
+    uint16_t    m_video_port    = 6970;
     uint32_t    m_display_w     = 1920;
     uint32_t    m_display_h     = 1080;
     float       m_refresh_rate  = 90.0f;

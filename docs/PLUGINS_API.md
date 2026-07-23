@@ -1,266 +1,359 @@
-# OpenDriver Plugins API (Detailed)
+# OpenDriver-VR Plugin API Guide
 
-This document is the technical reference for writing OpenDriver plugins.
-It focuses on practical, production-safe plugin development for the current architecture in this repository.
+> Document version: 1.4 · Last updated: May 2026
 
-## 1. Plugin Model in OpenDriver
+## Introduction
 
-OpenDriver loads plugins as dynamic libraries:
-- Windows: `.dll`
-- Linux: `.so`
+The OpenDriver-VR plugin system allows developers to add new VR hardware support (HMDs, controllers, trackers) without modifying the core driver. Plugins are compiled as dynamic libraries (`.dll` on Windows, `.so` on Linux) and loaded at runtime by the `opendriver_runner` process.
 
-At runtime, `PluginLoader` scans plugin directories and loads libraries defined by `plugin.json`.
-The core interacts with your plugin through the `IPlugin` and `IPluginContext` interfaces.
+This guide explains how to create, configure, and integrate a plugin.
 
-Key properties of the model:
-- Plugins are optional.
-- Plugins can be loaded/unloaded at runtime.
-- Plugin crashes in `OnTick()` are isolated and cause plugin disable/unload (not full runtime crash).
-- Hot-reload is supported through `ExportState()` / `ImportState()`.
+## Plugin Structure
 
-## 2. Required Exports and Metadata
+A plugin consists of two main parts:
+1. **The Plugin Manifest (`plugin.json`)**
+2. **The Shared Library (`.dll` / `.so`)**
 
-Every plugin library must export:
-- `CreatePlugin()`
-- `DestroyPlugin()`
+Plugins must be placed in the OpenDriver configuration directory:
+- Windows: `%APPDATA%\opendriver\plugins\<your_plugin_name>\`
+- Linux: `~/.config/opendriver/plugins/<your_plugin_name>/`
 
-Example:
-```cpp
-extern "C" {
-OD_EXPORT opendriver::core::IPlugin* CreatePlugin() {
-    return new MyPlugin();
-}
+### 1. The Manifest (`plugin.json`)
 
-OD_EXPORT void DestroyPlugin(opendriver::core::IPlugin* plugin) {
-    delete plugin;
-}
-}
-```
+Every plugin directory must contain a `plugin.json` file. This tells the core runtime how to load the plugin and provides metadata for the Dashboard.
 
-Your `IPlugin` implementation must provide metadata:
-- `GetName()`: stable ID-like name, lowercase, no spaces recommended.
-- `GetVersion()`: semantic version string.
-- `GetDescription()`
-- `GetAuthor()`
-
-`GetName()` must be stable over time. It is used by loader logic and state flows.
-
-## 3. `plugin.json` Contract
-
-`PluginLoader::LoadDirectory()` expects plugin directories with `plugin.json`.
-
-Important fields:
-- `entry_point` (required): filename of your compiled library.
-- `enabled` (optional, default `true`)
-- `name`, `version`, `description`, `author` (used by UI listing/metadata)
-
-Minimal example:
 ```json
 {
-  "name": "my_tracker",
-  "version": "1.0.0",
-  "description": "Example tracker plugin",
-  "author": "Your Team",
-  "enabled": true,
-  "entry_point": "my_tracker.dll"
+    "name": "my_custom_plugin",
+    "version": "1.0.0",
+    "author": "Your Name",
+    "description": "Adds support for custom DIY hardware.",
+    "entry_point": "my_custom_plugin.dll",
+    "enabled": true
 }
 ```
 
-If `entry_point` is missing, loader logs an error and skips the plugin.
+- **name**: Must be unique, lowercase, with no spaces.
+- **entry_point**: The filename of the compiled shared library.
 
-## 4. Lifecycle (Exact Order)
+### 2. The Shared Library
 
-Typical flow:
-1. Dynamic library load.
-2. Resolve `CreatePlugin`/`DestroyPlugin`.
-3. `CreatePlugin()` returns instance.
-4. `OnInitialize(IPluginContext*)`.
-5. Per-frame `OnTick(float delta_time)` while active.
-6. Optional `OnEvent(const Event&)` for subscribed events.
-7. On shutdown/unload: `OnShutdown()`.
-8. `DestroyPlugin()`.
+The shared library must implement the `opendriver::core::IPlugin` interface and export two C-linkage factory functions: `CreatePlugin` and `DestroyPlugin`.
 
-On `OnTick()` exception:
-- Core publishes `PLUGIN_ERROR`.
-- Plugin is scheduled for unload.
+## Core API Interfaces
 
-## 5. `IPlugin` Methods (What to Do in Each)
+To write a plugin, you need to include the OpenDriver core headers. The primary interface is defined in `include/opendriver/core/plugin_interface.h`.
 
-### `OnInitialize(IPluginContext*)`
-Use for:
-- Saving context pointer.
-- Registering devices.
-- Reading initial config values.
-- Starting sockets/threads/services.
-- Subscribing to events.
+### `IPlugin` Interface
 
-Return `false` only for hard failures (plugin should not run).
-
-### `OnTick(float delta_time)`
-Use for:
-- Polling latest device/sensor state.
-- Processing filters/smoothing.
-- Calling `UpdatePose` / `UpdateInput`.
-- Light diagnostics sampling.
-
-Keep it fast and non-blocking.
-
-### `OnEvent(const Event&)`
-Use for asynchronous reactions:
-- control events
-- runtime/UI requests
-- plugin-to-plugin communication via event bus
-
-### `OnShutdown()`
-Must:
-- stop all threads cleanly
-- close sockets/handles
-- unsubscribe from events
-- release owned resources
-
-Never rely on process exit to clean up.
-
-### Hot-reload hooks
-- `ExportState()`: return heap-allocated state pointer if needed.
-- `ImportState(void*)`: restore and free state.
-
-If you allocate in `ExportState()`, always free in `ImportState()`.
-
-## 6. `IPluginContext` Surface
-
-Main APIs:
-- `GetEventBus()`
-- `GetConfig()`
-- `Log(...)`, `LogInfo(...)`, etc.
-- `RegisterDevice(...)`, `UnregisterDevice(...)`, `UnregisterDevicesByPlugin(...)`
-- `UpdatePose(...)`
-- `UpdateInput(...)`
-- `GetPlugin(...)`
-- `PostToMainThread(...)`
-- `RequestShowEncoderSettings()`
-
-### Device registration
-Register once in `OnInitialize()`.
-Use a stable `Device.id` and correct `DeviceType`.
-
-### Pose and input updates
-Call frequently from `OnTick()` with current values.
-Use physically meaningful units and valid quaternions.
-
-### Logging
-Prefer context logging over `std::cout`.
-Keep log volume bounded in hot paths.
-
-### Config
-Read defaults defensively.
-Validate all user values before applying.
-
-### Main-thread handoff
-Use `PostToMainThread()` for operations requiring runtime-thread affinity.
-
-## 7. Threading and Concurrency Rules
-
-Plugin code is often multi-threaded (network + tick loop). Follow these rules:
-
-1. `OnTick()` must not block on long I/O.
-2. Use lock-free or short-lock data transfer from worker threads to tick thread.
-3. If a worker thread mutates shared state, guard with mutex/atomic.
-4. Never call plugin unload logic from worker threads.
-5. Keep event handlers re-entrant-safe.
-
-Recommended pattern:
-- worker thread writes latest snapshot into guarded struct
-- `OnTick()` reads snapshot and publishes pose/input
-
-## 8. Error Handling Strategy
-
-Use 3 classes of errors:
-- Recoverable transient (log warning, continue).
-- Recoverable degraded (disable a feature path, continue plugin).
-- Fatal init/runtime (return false in init or `IsActive() == false`).
-
-Do not throw exceptions out of `OnTick()` in production plugin code.
-If you use exceptions internally, catch inside plugin and convert to controlled state.
-
-## 9. Event Bus Usage
-
-Subscribe in `OnInitialize()`, unsubscribe in `OnShutdown()`.
-
-Typical flow:
-```cpp
-context->GetEventBus().Subscribe(opendriver::core::EventType::VIDEO_FRAME, this);
-```
-
-Event payload is stored in `std::any`.
-Always validate/cast carefully.
-
-## 10. Build and Packaging
-
-### In-repo build
-Create plugin target in this repo and copy output into plugin directory used by runtime.
-
-### Standalone build
-A plugin can be built in a separate repository with copied OpenDriver headers.
-You generally do not link against OpenDriver core library directly; ABI surface is interface-based.
-
-### Packaging checklist
-- library file
-- `plugin.json`
-- any required assets/config defaults
-- version bump
-
-## 11. Minimal Plugin Skeleton
+This is the main class your plugin must inherit from.
 
 ```cpp
 #include <opendriver/core/plugin_interface.h>
-#include <opendriver/core/platform.h>
 
-class MyPlugin : public opendriver::core::IPlugin {
+using namespace opendriver::core;
+
+class MyPlugin : public IPlugin {
 public:
-    const char* GetName() const override { return "my_plugin"; }
+    // --- Metadata ---
+    const char* GetName() const override { return "my_custom_plugin"; }
     const char* GetVersion() const override { return "1.0.0"; }
-    const char* GetDescription() const override { return "Example plugin"; }
-    const char* GetAuthor() const override { return "Team"; }
+    const char* GetDescription() const override { return "Custom hardware plugin"; }
+    const char* GetAuthor() const override { return "Your Name"; }
 
-    bool OnInitialize(opendriver::core::IPluginContext* context) override {
-        m_context = context;
-        return true;
-    }
+    // --- Lifecycle ---
+    bool OnInitialize(IPluginContext* context) override;
+    void OnShutdown() override;
 
-    void OnShutdown() override {}
-    void OnTick(float) override {}
+    // --- Per-frame Update ---
+    void OnTick(float delta_time) override;
+
+    // --- Event Handling ---
+    void OnEvent(const Event& event) override;
+
+    // --- Status & UI ---
     bool IsActive() const override { return true; }
+    std::string GetStatus() const override { return "Running normally"; }
+    IUIProvider* GetUIProvider() override { return nullptr; } // Optional Qt UI
+
+    // --- Hot Reload (Optional) ---
+    void* ExportState() override { return nullptr; }
+    void ImportState(void* state) override {}
 
 private:
-    opendriver::core::IPluginContext* m_context = nullptr;
+    IPluginContext* m_context = nullptr;
 };
+```
 
+#### Lifecycle Methods
+
+- **`OnInitialize(IPluginContext* context)`**: Called once when the plugin is loaded. This is where you should read configuration, initialize hardware connections, subscribe to events, and register virtual VR devices. Return `true` if successful. If you return `false`, the plugin will be immediately unloaded. Keep a pointer to `context` as you will need it.
+- **`OnShutdown()`**: Called when the runtime is shutting down or when the user disables the plugin. Clean up all resources, threads, and network sockets here. Devices registered by this plugin are automatically unregistered by the core.
+- **`OnTick(float delta_time)`**: Called every frame by the runtime (roughly 90 times per second for VR). You can poll hardware here, although for low-latency VR it is highly recommended to spawn a dedicated background thread in `OnInitialize` and use `OnTick` only for housekeeping.
+- **`OnEvent(const Event& event)`**: Called when an event you subscribed to is published on the Event Bus.
+
+### Factory Exports
+
+You MUST export `CreatePlugin` and `DestroyPlugin` so the loader can instantiate your class.
+
+```cpp
 extern "C" {
-OD_EXPORT opendriver::core::IPlugin* CreatePlugin() { return new MyPlugin(); }
-OD_EXPORT void DestroyPlugin(opendriver::core::IPlugin* plugin) { delete plugin; }
+    // Note: Use OD_EXPORT if defining the platform macros, or __declspec(dllexport)
+    __declspec(dllexport) IPlugin* CreatePlugin() {
+        return new MyPlugin();
+    }
+
+    __declspec(dllexport) void DestroyPlugin(IPlugin* plugin) {
+        delete plugin;
+    }
 }
 ```
 
-## 12. Production Readiness Checklist
+### `IPluginContext` Interface
 
-- Stable `GetName()`
-- `OnInitialize()` validates required resources
-- No blocking calls in `OnTick()`
-- Worker threads are stoppable and joined in `OnShutdown()`
-- Event subscriptions are balanced (subscribe/unsubscribe)
-- Config values validated and clamped
-- Pose quaternion normalized (or validated)
-- Log rate-limited for hot loops
-- Hot-reload state ownership is explicit and leak-free
-- Plugin handles missing device/network gracefully
+The `IPluginContext` is your gateway to the OpenDriver core. You receive it in `OnInitialize`.
 
-## 13. Debugging Tips
+```cpp
+class IPluginContext {
+public:
+    // Central Event Bus
+    virtual EventBus& GetEventBus() = 0;
 
-- Use plugin-specific log prefixes.
-- Add periodic (not per-frame) status summaries.
-- Expose useful counters in `GetStatus()`.
-- Reproduce failures with deterministic input playback where possible.
+    // JSON Configuration
+    virtual ConfigManager& GetConfig() = 0;
 
----
+    // Logging
+    virtual void Log(int level, const char* message) = 0;
+    virtual void LogInfo(const char* msg); // Helper
+    virtual void LogError(const char* msg); // Helper
 
-If you are starting from scratch, use `docs/DEVELOPER_GUIDE.md` as the step-by-step tutorial and this file as the reference.
+    // Device Management
+    virtual void RegisterDevice(const Device& device) = 0;
+    virtual void UnregisterDevice(const char* device_id) = 0;
+
+    // Data Submission (to SteamVR)
+    virtual void UpdatePose(const char* device_id, 
+                             double x, double y, double z, 
+                             double qw, double qx, double qy, double qz,
+                             double vx = 0, double vy = 0, double vz = 0,
+                             double avx = 0, double avy = 0, double avz = 0) = 0;
+                             
+    virtual void UpdateInput(const char* device_id, const char* component_name, float value) = 0;
+
+    // Safe execution on main thread
+    virtual void PostToMainThread(std::function<void()> callback) = 0;
+};
+```
+
+## Step-by-Step Examples
+
+### 1. Registering a Device
+
+To make SteamVR aware of your hardware, you must register a `Device`.
+
+```cpp
+#include <opendriver/core/device_registry.h>
+
+bool MyPlugin::OnInitialize(IPluginContext* context) {
+    m_context = context;
+
+    Device controller;
+    controller.id = "my_custom_controller";
+    controller.type = DeviceType::CONTROLLER; // Maps to vr::TrackedDeviceClass_Controller
+    controller.name = "Custom VR Wand";
+    controller.manufacturer = "DIY Co";
+    controller.serial_number = "WAND-001";
+    controller.owner_plugin = GetName();
+
+    // Define Inputs
+    InputComponent trigger;
+    trigger.name = "trigger";
+    trigger.type = InputType::SCALAR; // Float value 0.0 to 1.0
+    
+    InputComponent grip;
+    grip.name = "grip";
+    grip.type = InputType::BOOLEAN;   // 0 or 1
+
+    controller.inputs.push_back(trigger);
+    controller.inputs.push_back(grip);
+
+    m_context->RegisterDevice(controller);
+    m_context->LogInfo("Registered Custom VR Wand.");
+
+    return true;
+}
+```
+
+### 2. Updating Tracking Pose
+
+Pose updates should be sent frequently (e.g., from a dedicated reading thread).
+
+```cpp
+// X, Y, Z in meters
+// QW, QX, QY, QZ representing rotation
+// Velocities (vx, vy, vz, avx, avy, avz) are optional but highly recommended for SteamVR prediction!
+
+m_context->UpdatePose("my_custom_controller", 
+                      0.5, 1.2, -0.3,   // Position
+                      1.0, 0.0, 0.0, 0.0 // Quaternion (Identity)
+);
+```
+
+### 3. Updating Inputs
+
+Input updates are usually sent when a hardware state changes.
+
+```cpp
+// Button press
+m_context->UpdateInput("my_custom_controller", "grip", 1.0f);
+
+// Trigger pull (half-way)
+m_context->UpdateInput("my_custom_controller", "trigger", 0.5f);
+```
+
+### 4. Reading Configuration
+
+Configuration is stored in `%APPDATA%\opendriver\config.json`. You can read settings specific to your plugin.
+
+```cpp
+bool MyPlugin::OnInitialize(IPluginContext* context) {
+    // ...
+    auto& config = context->GetConfig();
+    
+    // config.json -> {"plugins": {"my_custom_plugin": {"smoothing_factor": 0.5}}}
+    nlohmann::json my_cfg = config.GetPluginConfig(GetName());
+    
+    float smoothing = my_cfg.value("smoothing_factor", 0.1f);
+    // ...
+}
+```
+
+### 5. Receiving Video Frames (For HMDs)
+
+If your plugin is implementing an HMD (like an Android streaming headset), you need to receive the encoded H.264 video frames from the core.
+
+```cpp
+bool MyPlugin::OnInitialize(IPluginContext* context) {
+    m_context = context;
+    // Subscribe to video frames
+    m_context->GetEventBus().Subscribe(EventType::VIDEO_FRAME, this);
+    return true;
+}
+
+void MyPlugin::OnEvent(const Event& event) {
+    if (event.type == EventType::VIDEO_FRAME) {
+        // Safe deserialization using vector<uint8_t> to avoid RTTI issues across DLLs
+        auto buffer = std::any_cast<std::vector<uint8_t>>(event.data);
+        
+        VideoFrameData frame;
+        if (VideoFrameData::Deserialize(buffer, frame)) {
+            // frame.nal_data contains the H.264 NAL units!
+            // frame.pts is the presentation timestamp
+            SendOverNetworkToHeadset(frame.nal_data);
+        }
+    }
+}
+```
+
+### 6. Providing a Custom UI
+
+If your plugin needs configuration UI (e.g., IP address fields, calibration buttons), implement `opendriver::core::IUIProvider`.
+
+```cpp
+#include <opendriver/core/iui_provider.h>
+#include <QWidget>
+#include <QLabel>
+#include <QVBoxLayout>
+
+class MyPluginUI : public opendriver::core::IUIProvider {
+public:
+    QWidget* CreateSettingsWidget(QWidget* parent) override {
+        QWidget* widget = new QWidget(parent);
+        QVBoxLayout* layout = new QVBoxLayout(widget);
+        
+        m_statusLabel = new QLabel("Waiting for data...", widget);
+        m_statusLabel->setStyleSheet("color: white;");
+        layout->addWidget(m_statusLabel);
+        
+        return widget;
+    }
+
+    void RefreshUI() override {
+        // Called by Dashboard every 500ms
+        if (m_statusLabel) {
+            m_statusLabel->setText("Ping: 12ms");
+        }
+    }
+private:
+    QLabel* m_statusLabel = nullptr;
+};
+```
+
+Then return it in your plugin:
+
+```cpp
+IUIProvider* MyPlugin::GetUIProvider() {
+    if (!m_ui) m_ui = new MyPluginUI();
+    return m_ui;
+}
+```
+
+## CMake Setup for Plugins
+
+The easiest way to build a plugin is to add it as a subdirectory within the OpenDriver-VR source tree, but you can also build it standalone.
+
+Example `CMakeLists.txt`:
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(my_custom_plugin)
+
+set(CMAKE_CXX_STANDARD 17)
+
+# We are building a shared library (.dll / .so)
+add_library(my_custom_plugin SHARED src/plugin.cpp)
+
+# Link against the OpenDriver Core library
+# If building standalone, you need to provide the path to OpenDriver headers and libopendriver_core
+target_link_libraries(my_custom_plugin PRIVATE opendriver_core)
+
+# (Optional) If you use Qt for UI
+target_link_libraries(my_custom_plugin PRIVATE Qt6::Widgets)
+
+# Don't add 'lib' prefix on Windows
+if(WIN32)
+    set_target_properties(my_custom_plugin PROPERTIES PREFIX "")
+endif()
+```
+
+## Hot Reloading
+
+When you recompile your plugin `.dll`/`.so`, the OpenDriver Runtime detects the file change and automatically reloads it.
+
+If your plugin holds state (e.g., active network connections or calibration data) that shouldn't be lost during reload, implement `ExportState` and `ImportState`.
+
+```cpp
+void* MyPlugin::ExportState() {
+    // Allocate a state object on the heap
+    auto* state = new PluginState();
+    state->ip_address = m_currentIp;
+    state->calibrated = m_isCalibrated;
+    return state;
+}
+
+void MyPlugin::ImportState(void* state) {
+    if (state) {
+        auto* saved = static_cast<PluginState*>(state);
+        m_currentIp = saved->ip_address;
+        m_isCalibrated = saved->calibrated;
+        delete saved; // Clean up!
+    }
+}
+```
+
+## Best Practices
+
+1. **Don't block `OnTick`**: `OnTick` runs on a tight loop. If you need to perform blocking I/O (sockets, serial port reading), spawn a `std::thread` in `OnInitialize`.
+2. **Use the Core Logger**: Use `m_context->LogInfo()` instead of `std::cout`. This ensures your logs appear in the Dashboard UI and the central `opendriver.log` file.
+3. **Catch Exceptions**: If your plugin throws an unhandled exception in `OnTick`, the core will catch it and forcibly disable your plugin to prevent the whole runtime from crashing. Catch exceptions yourself to recover gracefully.
+4. **Use Unique Names**: Ensure your `plugin.json` name and `Device.id` are globally unique to avoid conflicts with other developers' plugins.

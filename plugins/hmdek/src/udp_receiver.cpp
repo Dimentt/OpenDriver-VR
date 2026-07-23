@@ -137,6 +137,17 @@ void UdpTrackingReceiver::ReceiveLoop() {
             m_packet_count++;
             hz_counter++;
 
+        } catch (const nlohmann::json::parse_error& e) {
+            if (m_dropped_count % 100 == 0) {
+                // Log only occasionally to prevent spam
+                printf("OpenDriver [DX11]: JSON Parse Error at byte %d: %s\n", e.byte, e.what());
+            }
+            m_dropped_count++;
+        } catch (const std::exception& e) {
+            if (m_dropped_count % 100 == 0) {
+                printf("OpenDriver [DX11]: JSON Error: %s\n", e.what());
+            }
+            m_dropped_count++;
         } catch (...) {
             m_dropped_count++;
         }

@@ -17,7 +17,7 @@ option(WITH_QT_UI "Build Qt Dashboard UI widget (requires Qt5/Qt6)" OFF)
 set(PLUGIN_SOURCES
     src/plugin.cpp
     src/udp_receiver.cpp
-    src/tcp_sender.cpp
+    src/udp_sender.cpp
     src/pose_processor.cpp
     src/ui_provider.cpp
 )

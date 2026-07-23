@@ -39,6 +39,14 @@ function Assert-FileExists {
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectRoot = (Resolve-Path (Join-Path $scriptDir "..")).Path
+$buildDirs = @(
+    (Join-Path $projectRoot "build-clean"),
+    (Join-Path $projectRoot "build")
+)
+$buildDir = $buildDirs | Where-Object { Test-Path (Join-Path $_ "CMakeCache.txt") } | Select-Object -First 1
+if (-not $buildDir) {
+    $buildDir = Join-Path $projectRoot "build"
+}
 $driverDir = Join-Path $projectRoot "driver"
 $driverManifest = Join-Path $driverDir "driver.vrdrivermanifest"
 $driverDll = Join-Path $driverDir "bin\win64\driver_opendriver.dll"
@@ -52,7 +60,8 @@ $inputBindings = Join-Path $driverDir "resources\input\opendriver_hmd_vrcomposit
 
 if ($BuildRelease) {
     Write-Host "Building Release configuration..."
-    & cmake --build (Join-Path $projectRoot "build") --config Release --parallel
+    $env:QTFRAMEWORK_BYPASS_LICENSE_CHECK="1"
+    & cmake --build $buildDir --config Release --parallel
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed."
     }
